@@ -15,6 +15,7 @@
 -- rich-text labels, which replaces the old single-column tabs plus the
 -- compact_tab surgery this script used to perform on its own UI.
 local Airflow = loadstring(game:HttpGet("https://raw.githubusercontent.com/joustingmatch/-3/refs/heads/main/Source.luau"))()
+print("[Blz] build " .. os.time() .. " topwood-marker")
 
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
@@ -989,6 +990,22 @@ local function player_near(pos, radius)
 	return false
 end
 
+-- nearest other player to a position, flat distance — used by the Panic
+-- status readout and the farm stand-down below
+local function nearest_player_dist(pos)
+	local best, who = math.huge, nil
+	for _, p in ipairs(game.Players:GetPlayers()) do
+		if p ~= plr then
+			local root = p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+			if root then
+				local d = (root.Position - pos) * Vector3.new(1, 0, 1)
+				if d.Magnitude < best then best, who = d.Magnitude, p end
+			end
+		end
+	end
+	return best, who
+end
+
 local function pick(mode, blocked)
 	local folder = workspace:FindFirstChild("Map") and workspace.Map:FindFirstChild("Trees")
 	if not folder then return nil end
@@ -1278,6 +1295,21 @@ end
 local ladder = axe_ladder()
 local axeRows = {}
 
+-- Teleport without anchoring. An anchored root does not replicate its CFrame,
+-- so the server keeps the old position and every proximity check fails against
+-- it. Set the CFrame on a free root and zero the velocity instead. Defined
+-- before the UI block: the Top-wood snipe buttons below capture it in their
+-- callbacks, and a local declared later reads as a nil global inside them.
+local function teleport_to(pos, offset)
+	local root = hrp()
+	if not root or not pos then return false end
+	root.Anchored = false
+	root.CFrame = CFrame.new(pos + (offset or Vector3.new(0, 3, 4)))
+	root.AssemblyLinearVelocity = Vector3.zero
+	root.AssemblyAngularVelocity = Vector3.zero
+	return true
+end
+
 ----------------------------------------------------------------------
 -- ui
 ----------------------------------------------------------------------
@@ -1303,7 +1335,9 @@ local legitTab = Window:CreateTab({Name = "Legit", Icon = "shield"})
 local espTab = Window:CreateTab({Name = "ESP", Icon = "eye"})
 
 -- Two columns are native in the fork: groupboxes dock Left/Right, which is
--- what the old compact_tab surgery was imitating by hand.
+-- what the old compact_tab surgery was imitating by hand. Top wood is created
+-- first so it renders above Farming on the same column.
+local gbTop = farmTab:CreateGroupbox({Name = "Top wood", Side = "Left"})
 local gbFarm = farmTab:CreateGroupbox({Name = "Farming", Side = "Left"})
 local gbQuest = farmTab:CreateGroupbox({Name = "Quests", Side = "Left"})
 local gbSession = farmTab:CreateGroupbox({Name = "Session", Side = "Right"})
@@ -1327,12 +1361,76 @@ local function safe_set(label, text)
 	pcall(function() label:Set(text) end)
 end
 
+-- Top wood: the six highest-value live trees on the whole map, re-ranked
+-- every couple of seconds. Press a row: teleport to that tree and fell it
+-- exactly once through the same chop lane the farm uses, then stop — a
+-- targeted strike, not a farm run. The refresh loop at the bottom of the
+-- script rewrites the row texts and rebinds row.tree; the callbacks read the
+-- row table at click time, so a row always acts on the CURRENT tree.
+S.sniping = false
+getgenv().__TopErr = nil
+local okTop, errTop = pcall(function()
+	local topLabel = gbTop:CreateLabel("idle — live ranking")
+	local topRows = {}
+	for i = 1, 6 do
+		local row = {tree = nil}
+		topRows[i] = row
+		row.button = gbTop:CreateButton({
+			Name = "…",
+			Callback = function()
+				local t = row.tree
+				if S.sniping then return end
+				if not (t and t.Parent and t:FindFirstChild("Trunk") and is_live(t)) then
+					safe_set(topLabel, "gone — pick another")
+					return
+				end
+				S.sniping = true
+				safe_set(topLabel, "sniping " .. tostring(t:GetAttribute("Wood") or t.Name) .. "…")
+				task.spawn(function()
+					local good, result
+					local okP = pcall(function()
+						local pos = t.Trunk.Position
+						teleport_to(pos, Vector3.new(0, 3, 5))
+						task.wait(0.4)
+						good, result = chop_tree(t)
+					end)
+					if okP and good then
+						safe_set(topLabel, ("sniped %s"):format(tostring(t:GetAttribute("Wood") or t.Name)))
+					else
+						safe_set(topLabel, "fail: " .. tostring(okP and result or "chop threw"):sub(1, 18))
+					end
+					S.sniping = false
+				end)
+			end,
+		})
+	end
+	getgenv().__TopRows = topRows
+	getgenv().__TopLabel = topLabel
+end)
+if not okTop then getgenv().__TopErr = tostring(errTop) end
+
 -- Labels carry bare values, not "state: idle" prose. The Captain wants the
 -- number, not a sentence around it.
 local stateLabel = gbFarm:CreateStatus({Name = "State", Style = "Dot", Value = "idle"})
 local targetLabel = gbFarm:CreateLabel("-")
 local countLabel = gbFarm:CreateStatus({Name = "Chopped", Style = "Row", Value = "0 / 0"})
 local rateLabel = gbFarm:CreateStatus({Name = "Rate", Style = "Row", Value = "0/min"})
+-- live nearest-player readout for the panic radius: what the farm sees
+local panicLabel = gbFarm:CreateStatus({
+	Name = "Nearest",
+	Style = "Dot",
+	UpdateRate = 1,
+	Update = function()
+		if not S.panicOn then return "off", "Muted" end
+		local myRoot = hrp()
+		if not myRoot then return "no char", "Warning" end
+		local d, who = nearest_player_dist(myRoot.Position)
+		if d <= (S.panicRadius or 50) then
+			return ("! %s %dm"):format(who and who.DisplayName or "?", math.floor(d)), "Error"
+		end
+		return "%dm":format(math.floor(d)), "Success"
+	end,
+})
 
 local axeLabel = gbSession:CreateStatus({Name = "Axe", Style = "Row", Value = "-"})
 local buckLabel = gbSession:CreateStatus({Name = "Bucks", Style = "Row", Value = "$0"})
@@ -1558,6 +1656,29 @@ local function set_farm(on)
 	task.spawn(function()
 		while S.farm and alive() do
 			local ok, msg = pcall(function()
+				-- Panic stand-down: any player near ME stops everything.
+				-- Freezing beats fleeing — teleporting while observed is the
+				-- loudest signature this script has, and chop animations in
+				-- someone's face are worse. Resume only after the coast has
+				-- been clear for a few seconds so a player pacing the radius
+				-- edge doesn't make the farm flap on/off.
+				if S.panicOn then
+					local myRoot = hrp()
+					if myRoot then
+						local d, who = nearest_player_dist(myRoot.Position)
+						if d <= (S.panicRadius or 50) then
+							S.panicClearAt = nil
+							S.panicWho = who and who.DisplayName
+							task.wait(0.5)
+							return ("panic: %s %dm"):format(tostring(S.panicWho), math.floor(d))
+						end
+						if not S.panicClearAt then S.panicClearAt = os.clock() end
+						if os.clock() - S.panicClearAt < 5 then
+							task.wait(0.3)
+							return "panic cooldown"
+						end
+					end
+				end
 				-- a sell pass owns the character right now (merchant teleport
 				-- plus SellTrees proximity check); chopping would yank the root
 				-- away mid-call and every sell would land "TooFar"
@@ -2015,18 +2136,8 @@ local function find_miku()
 	return nil, nil
 end
 
--- Teleport without anchoring. An anchored root does not replicate its CFrame,
--- so the server keeps the old position and every proximity check fails against
--- it. Set the CFrame on a free root and zero the velocity instead.
-local function teleport_to(pos, offset)
-	local root = hrp()
-	if not root or not pos then return false end
-	root.Anchored = false
-	root.CFrame = CFrame.new(pos + (offset or Vector3.new(0, 3, 4)))
-	root.AssemblyLinearVelocity = Vector3.zero
-	root.AssemblyAngularVelocity = Vector3.zero
-	return true
-end
+-- teleport_to is hoisted above the UI block so the snipe-button callbacks
+-- capture the local, not a nil global.
 
 gbUtil:CreateButton({
 	Name = "TP to Miku",
@@ -2122,6 +2233,49 @@ getgenv().ForestFarm = {
 refresh_state()
 refresh_axe_info()
 refresh_ladder()
+
+-- Top wood live ranking: re-scan, re-rank, rewrite the six rows every 2s.
+-- Value-ranked across the WHOLE map (distance is shown, not filtered) — the
+-- point of the list is finding the best tree anywhere, then sniping it.
+task.spawn(function()
+	while alive() do
+		local rows = getgenv().__TopRows
+		local folder = workspace:FindFirstChild("Map") and workspace.Map:FindFirstChild("Trees")
+		if rows and folder then
+			local myRoot = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
+			local list = {}
+			for _, t in ipairs(folder:GetChildren()) do
+				if t:IsA("Model") and t:FindFirstChild("Trunk") and is_live(t) then
+					list[#list+1] = t
+				end
+			end
+			table.sort(list, function(a, b) return value_of(a) > value_of(b) end)
+			for i = 1, 6 do
+				local row = rows[i]
+				if row then
+					local t = list[i]
+					row.tree = t
+					if t and myRoot then
+						local d = math.floor((t.Trunk.Position - myRoot.Position).Magnitude)
+						pcall(function() row.button:SetText(("%s  %s  %s  %dm"):format(
+							tostring(t:GetAttribute("Wood") or t.Name),
+							fmt_val(value_of(t)),
+							tostring(t:GetAttribute("State") or "?"),
+							d)) end)
+					elseif t then
+						pcall(function() row.button:SetText(("%s  %s  %s"):format(
+							tostring(t:GetAttribute("Wood") or t.Name),
+							fmt_val(value_of(t)),
+							tostring(t:GetAttribute("State") or "?"))) end)
+					else
+						pcall(function() row.button:SetText("-") end)
+					end
+				end
+			end
+		end
+		task.wait(2)
+	end
+end)
 
 pcall(function()
 	Window:Notify({Title = "Blizzard", Content = "Farm hub ready", Duration = 4})
