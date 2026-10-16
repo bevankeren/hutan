@@ -1006,7 +1006,7 @@ local function nearest_player_dist(pos)
 	return best, who
 end
 
-local local function pick(mode, blocked)
+local function pick(mode, blocked)
 	local folder = workspace:FindFirstChild("Map") and workspace.Map:FindFirstChild("Trees")
 	if not folder then return nil end
 	local now = os.clock()
