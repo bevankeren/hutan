@@ -1423,7 +1423,8 @@ local okTop, errTop = pcall(function()
 			end,
 		})
 	end
-	getgenv().__TopRows = topRows
+	getgenv().__TopRows = nil -- v1 key: retired so stale pre-token loops skip writing
+	getgenv().__TopRowsV2 = topRows
 	getgenv().__TopLabel = topLabel
 end)
 if not okTop then getgenv().__TopErr = tostring(errTop) end
@@ -2283,8 +2284,11 @@ local function top_wood_row_text(t, dist)
 end
 
 task.spawn(function()
-	while alive() do
-		local rows = getgenv().__TopRows
+	-- token guard: a re-exec bumps S.token, which retires THIS loop — without
+	-- it two builds' ranking loops both rewrote the same rows every 2s
+	local myToken = S.token
+	while alive() and S.token == myToken do
+		local rows = getgenv().__TopRowsV2
 		local folder = workspace:FindFirstChild("Map") and workspace.Map:FindFirstChild("Trees")
 		if rows and folder then
 			local myRoot = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
