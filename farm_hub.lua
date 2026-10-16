@@ -15,7 +15,6 @@
 -- rich-text labels, which replaces the old single-column tabs plus the
 -- compact_tab surgery this script used to perform on its own UI.
 local Airflow = loadstring(game:HttpGet("https://raw.githubusercontent.com/joustingmatch/-3/refs/heads/main/Source.luau"))()
-print("[Blz] build " .. os.time() .. " topwood-marker")
 
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
