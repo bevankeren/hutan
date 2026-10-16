@@ -1,5 +1,8 @@
 
 local Airflow = loadstring(game:HttpGet("https://raw.githubusercontent.com/joustingmatch/-3/refs/heads/main/Source.luau"))()
+-- *Airflow.Flags is per library instance, so expose this one: the config sync reads
+-- the same table that actually owns the elements' flags*
+getgenv().__Airflow = Airflow
 
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
@@ -1304,6 +1307,10 @@ local farmTab = Window:CreateTab({Name = "Farm", Icon = "tree-pine"})
 local axeTab = Window:CreateTab({Name = "Axes", Icon = "axe"})
 local legitTab = Window:CreateTab({Name = "Legit", Icon = "shield"})
 local espTab = Window:CreateTab({Name = "ESP", Icon = "eye"})
+local settingsTab = Window:CreateTab({Name = "Settings", Icon = "settings"})
+
+local gbConfig = settingsTab:CreateGroupbox({Name = "Configs", Side = "Left"})
+local gbTheme = settingsTab:CreateGroupbox({Name = "Theme", Side = "Right"})
 
 local gbTop = farmTab:CreateGroupbox({Name = "Top wood", Side = "Left"})
 local gbFarm = farmTab:CreateGroupbox({Name = "Farming", Side = "Left"})
@@ -2313,6 +2320,110 @@ task.spawn(function()
 		task.wait(math.clamp(tonumber(S.refreshRate) or 1, 0.25, 10))
 	end
 end)
+
+-- *config + theme managers use the library's own save system: every element with a
+-- Flag is written to ForestersHub/<name>.json, autoload included*
+pcall(function()
+	settingsTab:CreateConfigManager({Name = "Configs", Side = "Left"})
+end)
+pcall(function()
+	settingsTab:CreateThemeManager({Name = "Themes", Side = "Right"})
+end)
+
+-- *S is the value the farm loops actually read, and it is seeded before the UI exists.
+-- A loaded config only fires each element's Callback, so without this the restored
+-- values never reach S and the running farm silently keeps the defaults.*
+local function sync_state_from_flags()
+	local F = Airflow.Flags
+	if type(F) ~= "table" or not next(F) then
+		F = getgenv().__Airflow and getgenv().__Airflow.Flags
+	end
+	if type(F) ~= "table" then return end
+	local function val(flag)
+		local f = F[flag]
+		if not f or type(f.Get) ~= "function" then return nil end
+		local ok, v = pcall(function() return f:Get() end)
+		return ok and v or nil
+	end
+	local v = val("MinRarity")
+	if type(v) == "string" then
+		S.minTier = (v == "Any") and 0 or (RARITY_TIER[v] or 0)
+	elseif type(v) == "table" and v[1] then
+		S.minTier = (v[1] == "Any") and 0 or (RARITY_TIER[v[1]] or 0)
+	end
+	v = val("TargetMode")
+	if type(v) == "string" then
+		for i, m in ipairs(MODES) do if m == v then modeIndex = i end end
+	elseif type(v) == "table" and v[1] then
+		for i, m in ipairs(MODES) do if m == v[1] then modeIndex = i end end
+	end
+	v = val("MinValue")
+	if tonumber(v) then S.minValue = tonumber(v) end
+	v = val("TopSort")
+	if type(v) == "string" then
+		S.topSort = (v == "Rarity" or v == "Odds") and v or "Money"
+	elseif type(v) == "table" and v[1] then
+		S.topSort = (v[1] == "Rarity" or v[1] == "Odds") and v[1] or "Money"
+	end
+	v = val("TopRows")
+	if tonumber(v) then S.maxRows = tonumber(v) end
+	v = val("WeightValue")
+	if tonumber(v) then S.weightValue = tonumber(v) / 100 end
+	v = val("RefreshRate")
+	if tonumber(v) then S.refreshRate = tonumber(v) end
+	v = val("IncludeGrowing")
+	if type(v) == "boolean" then S.includeGrowing = v end
+	v = val("PanicMode")
+	if type(v) == "boolean" then S.panicOn = v end
+	v = val("PanicRadius")
+	if tonumber(v) then S.panicRadius = tonumber(v) end
+	v = val("AutoSell")
+	if type(v) == "boolean" then S.autoSell = v end
+	v = val("SellAt")
+	if tonumber(v) then S.sellAt = tonumber(v) end
+	v = val("AutoPerfect")
+	if type(v) == "boolean" then
+		S.perfectOn = v
+		if v then perfect_hook_install() else perfect_hook_remove() end
+	end
+	local e = S.esp
+	v = val("EspMaxDist")
+	if tonumber(v) then e.maxDist = tonumber(v) end
+	v = val("EspMaxTags")
+	if tonumber(v) then e.maxTags = tonumber(v) end
+	v = val("EspTextSize")
+	if tonumber(v) then e.textSize = tonumber(v) end
+	v = val("EspValueColor")
+	if type(v) == "string" then
+		e.valueColor = (v == "Rarity") and "Rarity" or "Bands"
+	elseif type(v) == "table" and v[1] then
+		e.valueColor = (v[1] == "Rarity") and "Rarity" or "Bands"
+	end
+	v = val("EspRarity")
+	if type(v) == "boolean" then e.showRarity = v end
+	v = val("EspMutations")
+	if type(v) == "boolean" then e.showMutations = v end
+	v = val("EspDist")
+	if type(v) == "boolean" then e.showDist = v end
+	v = val("EspHideUnfellable")
+	if type(v) == "boolean" then e.hideUnfellable = v end
+	v = val("EspPlayers")
+	if type(v) == "boolean" and v ~= e.players then esp_apply("players", v) end
+	v = val("EspTrees")
+	if type(v) == "boolean" and v ~= e.trees then esp_apply("trees", v) end
+	v = val("EspMerchants")
+	if type(v) == "boolean" and v ~= e.merchants then esp_apply("merchants", v) end
+end
+
+pcall(function()
+	Window:OnConfigChanged(function()
+		pcall(sync_state_from_flags)
+	end)
+end)
+
+-- *LoadAutoload can run before every element exists, so it goes last and syncs after*
+pcall(function() Window:LoadAutoload() end)
+pcall(sync_state_from_flags)
 
 pcall(function()
 	Window:Notify({Title = "Blizzard", Content = "Farm hub ready", Duration = 4})
