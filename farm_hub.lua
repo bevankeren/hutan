@@ -127,6 +127,7 @@ S.minValue = tonumber(S.minValue) or 0
 S.maxRows = tonumber(S.maxRows) or 8
 S.weightValue = type(S.weightValue) == "number" and S.weightValue or 0.6
 S.includeGrowing = S.includeGrowing == true
+S.sweepOn = S.sweepOn == true
 do
 	local e = S.esp
 	e.players = e.players or false
@@ -640,6 +641,82 @@ local function hop_to_low_server()
 		pcall(function() TS:TeleportToPlaceInstance(game.PlaceId, best.id, plr) end)
 	end)
 	return ("hop: %d here -> %d/20"):format(here, best.count)
+end
+
+-- *sweep mode: the Captain wants autofarm to hunt Mythic/Secret, and when the server
+-- is picked clean, hop to the BUSIEST server (more players = faster Mythic/Secret
+-- respawn), then loop. This inverts the quiet-server logic.*
+local function has_sweep_targets(minTier)
+	local want = math.max(tonumber(minTier) or 5, 5)
+	local axeSpec = current_axe_spec()
+	for _, t in ipairs(workspace.Map.Trees:GetChildren()) do
+		if t:IsA("Model") and t:FindFirstChild("Trunk") and is_live(t) then
+			if tier_of(t:GetAttribute("Rarity")) >= want and can_fell(t, axeSpec) then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+local function hop_to_busiest_server()
+	local TS = game:GetService("TeleportService")
+	local HS = game:GetService("HttpService")
+	local here = #game.Players:GetPlayers()
+
+	local fetch = (typeof(http_request) == "function" and http_request)
+		or (typeof(request) == "function" and request)
+		or nil
+	if not fetch then
+		task.spawn(function()
+			pcall(function() TS:Teleport(game.PlaceId, plr) end)
+		end)
+		return ("rejoin (%d here)"):format(here)
+	end
+
+	local ok, res = pcall(fetch, {
+		Url = ("https://games.roblox.com/v1/games/%d/servers/Public?limit=100&excludeFullGames=true"):format(game.PlaceId),
+		Method = "GET",
+	})
+	local body = ok and res and (res.Body or res.body)
+	if not body then
+		task.spawn(function()
+			pcall(function() TS:Teleport(game.PlaceId, plr) end)
+		end)
+		return "rejoin (api fail)"
+	end
+
+	local okJ, data = pcall(function() return HS:JSONDecode(body) end)
+	if not okJ or type(data) ~= "table" or type(data.data) ~= "table" then
+		task.spawn(function()
+			pcall(function() TS:Teleport(game.PlaceId, plr) end)
+		end)
+		return "rejoin (bad json)"
+	end
+
+	-- *inverted: pick the fullest server that still has a slot*
+	local best = nil
+	for _, s in ipairs(data.data) do
+		if type(s) == "table" and type(s.id) == "string" and s.id ~= game.JobId then
+			local n = tonumber(s.playing) or 0
+			local max = tonumber(s.maxPlayers) or 20
+			if n < max and n > 0 and (not best or n > best.count) then
+				best = {count = n, id = s.id}
+			end
+		end
+	end
+
+	if not best then
+		return "no busy public server"
+	end
+	if best.count + 1 <= here then
+		return ("already among busiest (%d here, best %d)"):format(here, best.count)
+	end
+
+	task.spawn(function()
+		pcall(function() TS:TeleportToPlaceInstance(game.PlaceId, best.id, plr) end)
+	end)
+	return ("hop: %d here -> %d/%d (busiest)"):format(here, best.count, best.max)
 end
 
 local ESP = {folder = nil, treeTags = {}, playerTags = {}, merchTags = {}, conns = {}, counts = {}}
@@ -1724,6 +1801,18 @@ local function set_farm(on)
 				end
 				stats.felled += 1
 				S.lastFail = nil
+				-- *sweep: once the server has no Mythic/Secret left worth chopping, hop to
+				-- the busiest server; the autoexec re-runs the script there and the loop
+				-- continues on its own*
+				if S.sweepOn and not has_sweep_targets(S.minTier) then
+					refresh_state()
+					set_target_text("sweep done - hopping")
+					local msg = hop_to_busiest_server()
+					S.sweepHop = msg
+					safe_set(stateLabel, "SWEEP -> " .. msg)
+					task.wait(1.5)
+					return "sweep complete: " .. msg
+				end
 				refresh_axe_info()
 				if S.autoSell and not S.selling then
 					local held
@@ -1864,6 +1953,28 @@ gbFarm:CreateToggle({
 		S.includeGrowing = on
 		if topLabel then
 			safe_set(topLabel, on and "growing trees included" or "growing trees hidden")
+		end
+	end,
+})
+
+-- *sweep: farm Mythic/Secret only, and the moment the server runs out, hop to the
+-- busiest one (more players = faster Mythic/Secret respawn). The autoexec re-runs
+-- the script on the new server, so it loops without intervention.*
+gbFarm:CreateToggle({
+	Name = "Sweep Mythic+",
+	Flag = "SweepOn",
+	CurrentValue = S.sweepOn or false,
+	Callback = function(on)
+		S.sweepOn = on
+		if on then
+			S.minTier = math.max(tonumber(S.minTier) or 0, 5)
+			modeIndex = 1 -- Smart
+			safe_set(stateLabel, "sweep ON - Mythic+")
+		else
+			safe_set(stateLabel, "sweep off")
+		end
+		if topLabel then
+			safe_set(topLabel, on and "sweeping Mythic/Secret" or "sweep off")
 		end
 	end,
 })
@@ -2505,6 +2616,8 @@ local function sync_state_from_flags()
 	if tonumber(v) then S.refreshRate = tonumber(v) end
 	v = val("IncludeGrowing")
 	if type(v) == "boolean" then S.includeGrowing = v end
+	v = val("SweepOn")
+	if type(v) == "boolean" then S.sweepOn = v end
 	v = val("PanicMode")
 	if type(v) == "boolean" then S.panicOn = v end
 	v = val("PanicRadius")
