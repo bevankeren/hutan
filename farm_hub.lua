@@ -108,6 +108,14 @@ do
 	if prev and prev.window and typeof(prev.window) ~= "nil" then
 		pcall(function() prev.window:Destroy() end)
 	end
+	-- wipe the ESP overlay: the folder holds tree/player billboards, highlights
+	-- ride on characters and get swept by name. (Inline, not esp_teardown — that
+	-- local is declared later and would resolve to nil here.)
+	local espFolderOld = workspace:FindFirstChild("BlizzardESP")
+	if espFolderOld then pcall(function() espFolderOld:Destroy() end) end
+	for _, d in ipairs(workspace:GetDescendants()) do
+		if d:IsA("Highlight") and d.Name == "BlzPlayerHL" then pcall(function() d:Destroy() end) end
+	end
 	-- belt-and-braces fallback: if the window reference was lost, remove any
 	-- ScreenGui whose name matches Airflow's window naming, and nothing else.
 	local gui = plr:FindFirstChild("PlayerGui")
@@ -466,61 +474,283 @@ end
 
 local MODES = {"Nearest", "MostValuable", "SellValue", "Rarest", "Heaviest", "Biggest", "Any"}
 
--- Hop to the smallest server in this place. Walks the place's server pages via
--- TeleportService, picks the one with the fewest players, and joins it. Falls
--- back to a plain rejoin if the page call fails (private or restricted places
--- return nil).
+-- Hop to the smallest public server in this place.
+--
+-- Two things made the old hop dead on arrival:
+--  1. TeleportService:GetServerPlaceInstancesAsync does not exist on this
+--     executor, so there is no in-engine way to enumerate servers.
+--  2. This function referenced safe_set/stateLabel before their `local`
+--     declarations — lexical scoping resolved them to GLOBAL nil, so the first
+--     call errored inside task.spawn and the button silently did nothing.
+--
+-- The rewrite lists servers over the games HTTP API (verified working through
+-- the executor's http_request: 51 public servers returned for this place),
+-- sorts by population, and teleports to the emptiest one that is not the
+-- server we are already in. Returns a status string; the caller renders it, so
+-- scoping stays clean.
 local function hop_to_low_server()
 	local TS = game:GetService("TeleportService")
-	local placeId = game.PlaceId
+	local HS = game:GetService("HttpService")
 	local here = #game.Players:GetPlayers()
 
-	-- GetServerPlaceInstancesAsync does not exist on this executor — calling it
-	-- raises "is not a valid member of TeleportService". So there is no way to
-	-- enumerate servers and pick the emptiest one from in here.
-	--
-	-- What does work: rejoin, and let the matchmaker place us. A rejoin lands
-	-- in whatever server has room, which is usually a fresh, emptier one.
-	-- Refuse to bother when this server is already quiet.
-	local okApi = pcall(function() return TS.GetServerPlaceInstancesAsync end)
-
-	if okApi then
-		local best, cursor = nil, ""
-		pcall(function()
-			for _ = 1, 3 do
-				local res = TS:GetServerPlaceInstancesAsync(placeId, cursor)
-				if type(res) ~= "table" then break end
-				for _, inst in ipairs(res) do
-					if type(inst) == "table" and inst.Players then
-						local n = #inst.Players
-						if not best or n < best.count then
-							best = {count = n, id = inst.Id}
-						end
-					end
-				end
-				if not res.NextPageCursor or res.NextPageCursor == "" then break end
-				cursor = res.NextPageCursor
-			end
+	local fetch = (typeof(http_request) == "function" and http_request)
+		or (typeof(request) == "function" and request)
+		or nil
+	if not fetch then
+		-- no HTTP lane: plain rejoin and hope the matchmaker spreads us out
+		task.spawn(function()
+			pcall(function() TS:Teleport(game.PlaceId, plr) end)
 		end)
-		if best and best.count < here then
-			safe_set(stateLabel, ("hop: %d players"):format(best.count))
-			task.wait(0.4)
-			pcall(function() TS:TeleportToPlaceInstance(placeId, best.id, plr) end)
-			return
+		return ("rejoin (%d here)"):format(here)
+	end
+
+	local ok, res = pcall(fetch, {
+		Url = ("https://games.roblox.com/v1/games/%d/servers/Public?limit=100&excludeFullGames=true"):format(game.PlaceId),
+		Method = "GET",
+	})
+	local body = ok and res and (res.Body or res.body)
+	if not body then
+		task.spawn(function()
+			pcall(function() TS:Teleport(game.PlaceId, plr) end)
+		end)
+		return "rejoin (api fail)"
+	end
+
+	local okJ, data = pcall(function() return HS:JSONDecode(body) end)
+	if not okJ or type(data) ~= "table" or type(data.data) ~= "table" then
+		task.spawn(function()
+			pcall(function() TS:Teleport(game.PlaceId, plr) end)
+		end)
+		return "rejoin (bad json)"
+	end
+
+	-- emptiest server we are not already in
+	local best = nil
+	for _, s in ipairs(data.data) do
+		if type(s) == "table" and type(s.id) == "string" and s.id ~= game.JobId then
+			local n = tonumber(s.playing) or 999
+			local max = tonumber(s.maxPlayers) or 20
+			if n < max and (not best or n < best.count) then
+				best = {count = n, id = s.id}
+			end
 		end
 	end
 
-	if here <= 3 then
-		safe_set(stateLabel, ("already quiet: %d"):format(here))
-		return
+	if not best then
+		return "no other public server"
+	end
+	if best.count + 1 >= here then
+		-- joining it would not make this one any quieter than staying
+		return ("already among quietest (%d here, best %d)"):format(here, best.count)
 	end
 
-	safe_set(stateLabel, ("hop: %d -> rejoin"):format(here))
-	task.wait(0.4)
-	local ok, err = pcall(function() TS:Teleport(placeId, plr) end)
-	if not ok then
-		safe_set(stateLabel, "hop failed: " .. tostring(err):sub(1, 20))
+	task.spawn(function()
+		pcall(function() TS:TeleportToPlaceInstance(game.PlaceId, best.id, plr) end)
+	end)
+	return ("hop: %d here -> %d/20"):format(here, best.count)
+end
+
+----------------------------------------------------------------------
+-- ESP
+----------------------------------------------------------------------
+-- Purely client-side overlay: Highlights + BillboardGui tags. Nothing here
+-- touches a remote, so nothing replicates — other players and the server see
+-- none of it. One workspace Folder holds every instance, so unload is a single
+-- Destroy.
+--
+-- Trees are tagged with billboards only: Roblox renders at most ~31 Highlight
+-- instances at once, and a forest has far more trees than that. Labels carry
+-- species, worth and distance, green when the held axe can fell it, red when
+-- the island is beyond reach. Players get a full Highlight (players never
+-- exceed the Highlight budget) plus a name+distance tag.
+
+local ESP = {folder = nil, treeTags = {}, playerTags = {}, conns = {}}
+
+local function esp_ensure_folder()
+	if ESP.folder and ESP.folder.Parent then return ESP.folder end
+	local f = workspace:FindFirstChild("BlizzardESP")
+	if not f then
+		f = Instance.new("Folder")
+		f.Name = "BlizzardESP"
+		f.Parent = workspace
 	end
+	ESP.folder = f
+	return f
+end
+
+local function esp_kill_conns()
+	for _, c in ipairs(ESP.conns) do pcall(function() c:Disconnect() end) end
+	ESP.conns = {}
+end
+
+local function esp_kill_highlights()
+	for _, d in ipairs(workspace:GetDescendants()) do
+		if d:IsA("Highlight") and d.Name == "BlzPlayerHL" then d:Destroy() end
+	end
+end
+
+local function esp_make_billboard(name, adornee, text, color, widthPx)
+	local bb = Instance.new("BillboardGui")
+	bb.Name = name
+	bb.Adornee = adornee
+	bb.Size = UDim2.fromOffset(widthPx, 42)
+	bb.StudsOffset = Vector3.new(0, 3.2, 0)
+	bb.AlwaysOnTop = true
+	bb.MaxDistance = 700
+	local t = Instance.new("TextLabel")
+	t.BackgroundTransparency = 1
+	t.Size = UDim2.fromScale(1, 1)
+	t.Font = Enum.Font.GothamBold
+	t.TextScaled = true
+	t.Text = text
+	t.TextColor3 = color
+	t.TextStrokeTransparency = 0.2
+	t.TextStrokeColor3 = Color3.new(0, 0, 0)
+	t.Parent = bb
+	return bb
+end
+
+local function esp_tag_player(p)
+	local char = p.Character
+	if not char then return end
+	local root = char:FindFirstChild("HumanoidRootPart")
+	if not root then return end
+	if not char:FindFirstChild("BlzPlayerHL") then
+		local hl = Instance.new("Highlight")
+		hl.Name = "BlzPlayerHL"
+		hl.FillColor = Color3.fromRGB(255, 70, 70)
+		hl.OutlineColor = Color3.new(1, 1, 1)
+		hl.FillTransparency = 0.65
+		hl.OutlineTransparency = 0
+		hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+		hl.Adornee = char
+		hl.Parent = char
+	end
+	if not ESP.playerTags[p] then
+		local bb = esp_make_billboard("BlzPlayerTag", root, p.Name, Color3.fromRGB(255, 90, 90), 160)
+		bb.Parent = esp_ensure_folder()
+		ESP.playerTags[p] = bb
+	end
+end
+
+local function esp_players_loop(myToken)
+	-- keep tags aligned with join/leave/respawn while the toggle is on
+	table.insert(ESP.conns, game.Players.PlayerAdded:Connect(function()
+		task.wait(1)
+		if S.espPlayers and S.token == myToken then
+			for _, p in ipairs(game.Players:GetPlayers()) do
+				if p ~= plr then esp_tag_player(p) end
+			end
+		end
+	end))
+	table.insert(ESP.conns, game.Players.PlayerRemoving:Connect(function(p)
+		local bb = ESP.playerTags[p]
+		if bb then bb:Destroy() end
+		ESP.playerTags[p] = nil
+	end))
+	table.insert(ESP.conns, plr.CharacterAdded:Connect(function()
+		task.wait(1)
+		if not (S.espPlayers and S.token == myToken) then return end
+		for _, p in ipairs(game.Players:GetPlayers()) do
+			if p ~= plr then esp_tag_player(p) end
+		end
+	end))
+	while S.espPlayers and S.token == myToken do
+		for _, p in ipairs(game.Players:GetPlayers()) do
+			if p ~= plr then esp_tag_player(p) end
+		end
+		-- distance refresh
+		local myRoot = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
+		if myRoot then
+			for p, bb in pairs(ESP.playerTags) do
+				local r = p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+				if r then
+					local d = math.floor((r.Position - myRoot.Position).Magnitude)
+					pcall(function() bb.TextLabel.Text = ("%s %dm"):format(p.Name, d) end)
+				end
+			end
+		end
+		task.wait(0.25)
+	end
+end
+
+local function esp_trees_loop(myToken)
+	while S.espTrees and S.token == myToken do
+		local myRoot = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
+		local folder = workspace:FindFirstChild("Map") and workspace.Map:FindFirstChild("Trees")
+		if myRoot and folder then
+			local axeSpec = current_axe_spec()
+			-- collect live trees, nearest first, then tag the closest N
+			local near = {}
+			for _, t in ipairs(folder:GetChildren()) do
+				if t:IsA("Model") and t:FindFirstChild("Trunk") and is_live(t) then
+					local pp = t.Trunk
+					local d = (pp.Position - myRoot.Position).Magnitude
+					if d <= 800 then
+						near[#near+1] = {t = t, d = d}
+					end
+				end
+			end
+			table.sort(near, function(a, b) return a.d < b.d end)
+			local keep, shown = {}, 0
+			for _, e in ipairs(near) do
+				if shown >= 22 then break end
+				keep[e.t] = true
+				shown += 1
+				local tag = ESP.treeTags[e.t]
+				local felled = e.t:GetAttribute("Felled")
+				local okFell = (not felled) and can_fell(e.t, axeSpec)
+				local label = ("%s $%d %dm%s"):format(
+					e.t.Name,
+					math.floor(value_of(e.t)),
+					math.floor(e.d),
+					felled and " X" or "")
+				if not tag or not tag.Parent then
+					tag = esp_make_billboard("BlzTreeTag", e.t.Trunk, label,
+						okFell and Color3.fromRGB(90, 255, 120) or Color3.fromRGB(255, 90, 90), 190)
+					tag.Parent = esp_ensure_folder()
+					ESP.treeTags[e.t] = tag
+				else
+					pcall(function()
+						tag.TextLabel.Text = label
+						tag.TextLabel.TextColor3 = okFell and Color3.fromRGB(90, 255, 120) or Color3.fromRGB(255, 90, 90)
+					end)
+				end
+			end
+			-- drop tags whose tree left the nearest set or died
+			for t, tag in pairs(ESP.treeTags) do
+				if not keep[t] then
+					tag:Destroy()
+					ESP.treeTags[t] = nil
+				end
+			end
+		end
+		task.wait(1.5)
+	end
+end
+
+local function esp_apply(kind, on)
+	local myToken = S.token
+	if kind == "players" then
+		S.espPlayers = on
+		if on then
+			task.spawn(esp_players_loop, myToken)
+		else
+			for _, bb in pairs(ESP.playerTags) do pcall(function() bb:Destroy() end) end
+			table.clear(ESP.playerTags)
+			esp_kill_highlights()
+		end
+	elseif kind == "trees" then
+		S.espTrees = on
+		if on then
+			task.spawn(esp_trees_loop, myToken)
+		else
+			for _, tag in pairs(ESP.treeTags) do pcall(function() tag:Destroy() end) end
+			table.clear(ESP.treeTags)
+		end
+	end
+	-- both overlays off: no reason to keep the join/leave/respawn listeners
+	if not S.espPlayers and not S.espTrees then esp_kill_conns() end
 end
 
 -- Panic mode: true when another player is within radius of a position. Trees
@@ -929,6 +1159,22 @@ legitTab:CreateToggle({
 	end,
 })
 
+local espTab = Window:CreateTab({Name = "ESP", Icon = "eye"})
+espTab:CreateSection({Name = "Overlay"})
+-- client-side only: Highlights + billboards, nothing replicates
+espTab:CreateToggle({
+	Name = "Players",
+	Callback = function(on)
+		esp_apply("players", on)
+	end,
+})
+espTab:CreateToggle({
+	Name = "Trees",
+	Callback = function(on)
+		esp_apply("trees", on)
+	end,
+})
+
 local stats = {felled = 0, failed = 0, startedAt = 0, blocked = {}}
 local modeIndex = 1
 local farmOn = false
@@ -1213,7 +1459,12 @@ farmTab:CreateSection({Name = "Server"})
 farmTab:CreateButton({
 	Name = "Hop to low server",
 	Callback = function()
-		task.spawn(function() hop_to_low_server() end)
+		task.spawn(function()
+			local msg = hop_to_low_server()
+			-- the teleport, when it happens, disconnects us within a second —
+			-- still show where we were headed so a fail is readable
+			pcall(function() stateLabel:Set(msg) end)
+		end)
 	end,
 })
 
