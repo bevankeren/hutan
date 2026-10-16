@@ -1558,6 +1558,13 @@ local function set_farm(on)
 	task.spawn(function()
 		while S.farm and alive() do
 			local ok, msg = pcall(function()
+				-- a sell pass owns the character right now (merchant teleport
+				-- plus SellTrees proximity check); chopping would yank the root
+				-- away mid-call and every sell would land "TooFar"
+				if S.selling then
+					task.wait(0.25)
+					return "selling in progress"
+				end
 				local mode = MODES[modeIndex]
 				local root = hrp()
 				if not root then
@@ -1602,7 +1609,7 @@ local function set_farm(on)
 				-- once the inventory was well past 80. Quote.Count is the
 				-- server's held-log count and is readable from anywhere; the
 				-- old tree counter stays as fallback when Quote misbehaves.
-				if S.autoSell then
+				if S.autoSell and not S.selling then
 					local held
 					local okQ, q = pcall(function() return call(LumberMillService, "Quote") end)
 					if okQ and type(q) == "table" and type(q.Count) == "number" then
@@ -1614,11 +1621,24 @@ local function set_farm(on)
 					end
 					safe_set(sellLabel, ("%d / %d"):format(held, S.sellAt or 50))
 					if held >= (S.sellAt or 50) then
+						-- one sell pass at a time, and the farm loop stands down
+						-- while it runs (see the S.selling check above): without
+						-- that, every felled tree spawned another pass because
+						-- Quote never dropped, and the passes fought the farm's
+						-- teleports — label pinned on "selling…" forever
+						S.selling = true
 						safe_set(sellLabel, "selling…")
 						task.spawn(function()
-							local okSell, why = auto_sell_pass()
+							local okP, r1, r2 = pcall(auto_sell_pass)
+							local okSell, why
+							if okP then
+								okSell, why = r1, r2
+							else
+								okSell, why = false, tostring(r1)
+							end
 							if okSell then S.logCount = 0 end
 							safe_set(sellLabel, okSell and "sold" or ("fail: " .. tostring(why):sub(1, 16)))
+							S.selling = false
 						end)
 					end
 				end
