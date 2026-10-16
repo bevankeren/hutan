@@ -116,6 +116,13 @@ S.autoSell = S.autoSell or false
 S.sellAt = S.sellAt or 50
 S.logCount = S.logCount or 0
 S.esp = S.esp or {}
+-- farm filter: only chop trees at or above this rarity tier
+if type(S.minTier) ~= "number" then S.minTier = 0 end
+S.refreshRate = tonumber(S.refreshRate) or 1
+S.topSort = type(S.topSort) == "string" and S.topSort or "Money"
+S.minValue = tonumber(S.minValue) or 0
+S.maxRows = tonumber(S.maxRows) or 8
+S.weightValue = type(S.weightValue) == "number" and S.weightValue or 0.6
 do
 	local e = S.esp
 	e.players = e.players or false
@@ -291,56 +298,159 @@ local function call(service, method, ...)
 end
 
 local WoodConfig = require(RS.Modules.Lumber.WoodConfig)
+local okSC, SpeciesConfig = pcall(function() return require(RS.Modules.Lumber.SpeciesConfig) end)
+if not okSC or type(SpeciesConfig) ~= "table" then SpeciesConfig = nil end
+local okTR, TreeRoll = pcall(function() return require(RS.Modules.Lumber.TreeRoll) end)
+if not okTR or type(TreeRoll) ~= "table" then TreeRoll = nil end
+
+-- *calibrated live against LumberMillService:Quote deltas — payout is linear in Weight,
+-- and slope/PricePerTonne measured 1.797..1.828 across four biomes = WoodConfig.ValueScale*
+local VALUE_SCALE = tonumber(WoodConfig.ValueScale) or 1.8
+local PERFECT_MULT = tonumber(WoodConfig.PerfectValueMultiplier) or 1.2
+
 local tierCache = {}
 local function rarity_info(rarity)
 	if tierCache[rarity] == nil then
 		local ok, info = pcall(function() return WoodConfig.GetRarity(rarity) end)
-		tierCache[rarity] = (ok and info) or {Tier = 0, ValueMultiplier = 1}
+		tierCache[rarity] = (ok and type(info) == "table" and info) or {Tier = 0, ValueMultiplier = 1, Chance = 1}
 	end
 	return tierCache[rarity]
 end
 local function tier_of(rarity)
-	return rarity_info(rarity).Tier or 0
+	return tonumber(rarity_info(rarity).Tier) or 0
+end
+
+-- rarity ladder straight out of the game's config, ordered by Tier
+local RARITY_ORDER, RARITY_TIER = {}, {}
+do
+	local list = {}
+	for _, r in ipairs(WoodConfig.Rarities or {}) do
+		if type(r) == "table" and r.Name then
+			list[#list+1] = {name = tostring(r.Name), tier = tonumber(r.Tier) or 0}
+		end
+	end
+	table.sort(list, function(a, b) return a.tier < b.tier end)
+	for _, r in ipairs(list) do
+		RARITY_ORDER[#RARITY_ORDER+1] = r.name
+		RARITY_TIER[r.name] = r.tier
+	end
+	if #RARITY_ORDER == 0 then
+		RARITY_ORDER = {"Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythic", "Secret"}
+		for i, n in ipairs(RARITY_ORDER) do RARITY_TIER[n] = i - 1 end
+	end
+end
+local MIN_RARITY_OPTIONS = {"Any"}
+for _, n in ipairs(RARITY_ORDER) do MIN_RARITY_OPTIONS[#MIN_RARITY_OPTIONS+1] = n end
+
+local sizeMultCache = {}
+local function size_mult(name)
+	if not name then return 1 end
+	if sizeMultCache[name] ~= nil then return sizeMultCache[name] end
+	local m = 1
+	for _, z in ipairs(WoodConfig.Sizes or {}) do
+		if type(z) == "table" and z.Name == name then
+			m = tonumber(z.ValueMultiplier) or 1
+			break
+		end
+	end
+	sizeMultCache[name] = m
+	return m
+end
+
+-- *Mutations is a comma-separated STRING on live trees ("Golden"), not a table —
+-- the old build only read tables, so every mutation bonus and chance was silently dropped*
+local function mutation_names(tree)
+	local raw = tree:GetAttribute("Mutations")
+	local out = {}
+	if type(raw) == "string" then
+		if raw ~= "" then
+			for name in string.gmatch(raw, "[^,%s]+") do out[#out+1] = name end
+		end
+	elseif type(raw) == "table" then
+		for _, v in ipairs(raw) do
+			if type(v) == "string" then
+				out[#out+1] = v
+			elseif tonumber(v) and type(WoodConfig.Mutations) == "table" then
+				local m = WoodConfig.Mutations[tonumber(v)]
+				if type(m) == "table" and m.Name then out[#out+1] = tostring(m.Name) end
+			end
+		end
+	end
+	return out
+end
+
+local function mutation_mult(tree)
+	local mult = 1
+	for _, name in ipairs(mutation_names(tree)) do
+		local ok, info = pcall(function() return WoodConfig.GetMutation(name) end)
+		if ok and type(info) == "table" and tonumber(info.ValueMultiplier) then
+			mult = mult * info.ValueMultiplier
+		end
+	end
+	return mult
+end
+
+local pptCache = {}
+local function price_per_tonne(biome)
+	if not biome then return 0 end
+	if pptCache[biome] ~= nil then return pptCache[biome] end
+	local ppt = 0
+	if SpeciesConfig and type(SpeciesConfig.PricePerTonne) == "function" then
+		local ok, v = pcall(function() return SpeciesConfig.PricePerTonne(biome) end)
+		if ok and tonumber(v) then ppt = tonumber(v) end
+	end
+	if ppt == 0 and type(WoodConfig.Biomes) == "table" then
+		local b = WoodConfig.Biomes[biome]
+		if type(b) == "table" and tonumber(b.PricePerTonne) then ppt = tonumber(b.PricePerTonne) end
+	end
+	pptCache[biome] = ppt
+	return ppt
+end
+
+-- Weight is kilograms: /1000 lands exactly on the species' Tonnes figure
+local function tonnes_of(t)
+	return (tonumber(t:GetAttribute("Weight")) or 0) / 1000
+end
+
+local function tree_value(t, withPerfect)
+	local base = tonnes_of(t) * price_per_tonne(t:GetAttribute("Biome")) * VALUE_SCALE
+	local rvm = tonumber(rarity_info(t:GetAttribute("Rarity")).ValueMultiplier) or 1
+	local perfect = withPerfect and PERFECT_MULT or 1
+	return base * rvm * size_mult(t:GetAttribute("Size")) * mutation_mult(t) * perfect
 end
 
 local function value_of(tree)
-	local info = rarity_info(tree:GetAttribute("Rarity"))
-	local mult = info.ValueMultiplier or 1
-	local scale = tree:GetAttribute("Scale") or 1
-	local muts = tree:GetAttribute("Mutations")
-	local mutBonus = 1
-	if type(muts) == "table" then
-		for _ in pairs(muts) do mutBonus += 0.5 end
-	end
-	return mult * scale * mutBonus
+	return tree_value(tree, S.perfectOn)
 end
 
 local function sell_value_of(tree)
-	local info = rarity_info(tree:GetAttribute("Rarity"))
-	local mult = info.ValueMultiplier or 1
-	local weight = tree:GetAttribute("Weight") or 0
-	return weight * mult
+	return tree_value(tree, S.perfectOn)
 end
 
+-- *real spawn odds straight from the game's own TreeRoll — no more invented 1/N*
 local function tree_odds(t)
-	local okC, chance = pcall(function()
+	if TreeRoll and type(TreeRoll.OneIn) == "function" then
+		local ok, n = pcall(function()
+			return TreeRoll.OneIn(t:GetAttribute("Biome"), t:GetAttribute("Rarity"),
+				t:GetAttribute("Size"), mutation_names(t))
+		end)
+		if ok and tonumber(n) and tonumber(n) > 0 then return tonumber(n) end
+	end
+	local chance = 1
+	local okC, rc = pcall(function()
 		return WoodConfig.RarityChance(t:GetAttribute("Biome"), t:GetAttribute("Rarity"))
 	end)
-	if not okC or type(chance) ~= "number" or chance <= 0 then
-		local info = rarity_info(t:GetAttribute("Rarity"))
-		chance = tonumber(info and info.Chance) or 1
+	if okC and tonumber(rc) and tonumber(rc) > 0 then
+		chance = chance * tonumber(rc)
+	else
+		chance = chance * (tonumber(rarity_info(t:GetAttribute("Rarity")).Chance) or 1)
 	end
-	local scale = tonumber(t:GetAttribute("Scale")) or 1
-	local okS, schance = pcall(function() return WoodConfig.ScaleChance(scale) end)
-	if okS and type(schance) == "number" and schance > 0 then
-		chance = chance * schance
-	end
-	local muts = t:GetAttribute("Mutations")
-	if type(muts) == "table" then
-		for _, idx in ipairs(muts) do
-			local m = tonumber(idx) and WoodConfig.Mutations[tonumber(idx)]
-			local mc = type(m) == "table" and tonumber(m.Chance)
-			if mc and mc > 0 then chance = chance * mc end
+	local okS, sc = pcall(function() return WoodConfig.ScaleChance(tonumber(t:GetAttribute("Scale")) or 1) end)
+	if okS and tonumber(sc) and tonumber(sc) > 0 then chance = chance * tonumber(sc) end
+	for _, name in ipairs(mutation_names(t)) do
+		local okM, mi = pcall(function() return WoodConfig.GetMutation(name) end)
+		if okM and type(mi) == "table" and tonumber(mi.Chance) and tonumber(mi.Chance) > 0 then
+			chance = chance * tonumber(mi.Chance)
 		end
 	end
 	if chance <= 0 then chance = 1e-9 end
@@ -348,20 +458,11 @@ local function tree_odds(t)
 end
 
 local function tree_price(t)
-	local info = rarity_info(t:GetAttribute("Rarity"))
-	local mult = info.ValueMultiplier or 1
-	local weight = tonumber(t:GetAttribute("Weight")) or 0
-	local mutMult = 1
-	local muts = t:GetAttribute("Mutations")
-	if type(muts) == "table" then
-		for _, idx in ipairs(muts) do
-			local m = tonumber(idx) and WoodConfig.Mutations[tonumber(idx)]
-			if type(m) == "table" and tonumber(m.ValueMultiplier) then
-				mutMult = mutMult * m.ValueMultiplier
-			end
-		end
-	end
-	return weight * mult * mutMult
+	return tree_value(t, S.perfectOn)
+end
+
+local function passes_rarity(t)
+	return tier_of(t:GetAttribute("Rarity")) >= (S.minTier or 0)
 end
 
 local function tree_size_label(t)
@@ -429,7 +530,25 @@ local function chop_seconds(tree, axeSpec)
 	return nil
 end
 
-local MODES = {"Nearest", "MostValuable", "SellValue", "Rarest", "Heaviest", "Biggest", "Any"}
+local MODES = {"Smart", "MostValuable", "Rarest", "SellValue", "Heaviest", "Biggest", "Nearest", "Any"}
+
+-- *"chance gede tp harga sampah" — a 1-in-a-million tree worth nothing is worth nothing, and a
+-- heavy Common worth $40 beats a Mythic worth $30. Smart mode ranks by expected value per chop
+-- (real price, real spawn odds), blended with rarity so a Mythic never loses to an Uncommon
+-- by a hair. weightValue = 0 -> pure money, 1 -> pure rarity.*
+local function top_score(t)
+	local money = tree_value(t, S.perfectOn)
+	if money <= 0 then return -1e18, money, 0 end
+	-- *floor of $1: sub-dollar weed trees are never worth a teleport, and they were
+	-- polluting the table whenever a big-odds roll landed on one*
+	if money < 1 then return -1e17 + money, money, tree_odds(t) end
+	local odds = tree_odds(t)
+	local rare = 1 + tier_of(t:GetAttribute("Rarity"))
+	local w = math.clamp(tonumber(S.weightValue) or 0.6, 0, 1)
+	local moneyTerm = math.log10(1 + money)
+	local rareTerm = math.log10(1 + odds) * 0.35 + math.log10(rare) * 2
+	return (1 - w) * moneyTerm + w * rareTerm, money, odds
+end
 
 local function hop_to_low_server()
 	local TS = game:GetService("TeleportService")
@@ -618,14 +737,13 @@ local function esp_tree_text(t, dist, okFell)
 		l2[#l2+1] = ('<font color="%s">%s</font>'):format(hex(rc), rarity:sub(1, 4))
 	end
 	if espCfg.showMutations then
-		local muts = t:GetAttribute("Mutations")
-		if type(muts) == "table" then
-			for _, idx in ipairs(muts) do
-				local mi = mutation_info(idx)
-				if mi then
-					l2[#l2+1] = ('<font color="%s">%s</font>'):format(
-						hex(mi.Color or Color3.new(1, 1, 1)), mi.Name:sub(1, 5))
-				end
+		-- *Mutations is a comma-separated string on live trees, so the old
+		-- type(muts)=="table" guard silently hid every mutation tag*
+		for _, name in ipairs(mutation_names(t)) do
+			local ok, mi = pcall(function() return WoodConfig.GetMutation(name) end)
+			if ok and type(mi) == "table" then
+				l2[#l2+1] = ('<font color="%s">%s</font>'):format(
+					hex(mi.Color or Color3.new(1, 1, 1)), tostring(mi.Name):sub(1, 5))
 			end
 		end
 	end
@@ -888,17 +1006,21 @@ local function nearest_player_dist(pos)
 	return best, who
 end
 
-local function pick(mode, blocked)
+local local function pick(mode, blocked)
 	local folder = workspace:FindFirstChild("Map") and workspace.Map:FindFirstChild("Trees")
 	if not folder then return nil end
 	local now = os.clock()
 	local axeSpec = current_axe_spec()
+	local minTier = tonumber(S.minTier) or 0
 	local list = {}
-	local skipped = 0
-	local panicked = 0
+	local skipped, panicked, filtered = 0, 0, 0
 	for _, t in ipairs(folder:GetChildren()) do
 		if is_live(t) and not (blocked[t] and blocked[t] > now) then
-			if S.panicOn and player_near(t:GetPivot().Position, S.panicRadius) then
+			if not passes_rarity(t) then
+				-- *this is the bug the Captain saw: an Uncommon outranking a Mythic.
+				-- the floor drops it out of the pool entirely before any sorting.*
+				filtered += 1
+			elseif S.panicOn and player_near(t:GetPivot().Position, S.panicRadius) then
 				panicked += 1
 			elseif can_fell(t, axeSpec) then
 				table.insert(list, t)
@@ -909,6 +1031,7 @@ local function pick(mode, blocked)
 	end
 	S.panicked = panicked
 	S.skipped = skipped
+	S.filtered = filtered
 	if #list == 0 then return nil end
 
 	local root = hrp()
@@ -922,10 +1045,8 @@ local function pick(mode, blocked)
 		table.sort(list, function(a, b) return dist(a) < dist(b) end)
 	elseif mode == "MostValuable" then
 		table.sort(list, function(a, b)
-			local va, vb = value_of(a), value_of(b)
+			local va, vb = tree_value(a, S.perfectOn), tree_value(b, S.perfectOn)
 			if va ~= vb then return va > vb end
-			local ta, tb = tier_of(a:GetAttribute("Rarity")), tier_of(b:GetAttribute("Rarity"))
-			if ta ~= tb then return ta > tb end
 			return dist(a) < dist(b)
 		end)
 	elseif mode == "SellValue" then
@@ -938,7 +1059,9 @@ local function pick(mode, blocked)
 		table.sort(list, function(a, b)
 			local ta, tb = tier_of(a:GetAttribute("Rarity")), tier_of(b:GetAttribute("Rarity"))
 			if ta ~= tb then return ta > tb end
-			return (a:GetAttribute("Weight") or 0) > (b:GetAttribute("Weight") or 0)
+			local va, vb = tree_value(a, S.perfectOn), tree_value(b, S.perfectOn)
+			if va ~= vb then return va > vb end
+			return dist(a) < dist(b)
 		end)
 	elseif mode == "Heaviest" then
 		table.sort(list, function(a, b)
@@ -951,6 +1074,12 @@ local function pick(mode, blocked)
 			local sa, sb = a:GetAttribute("Scale") or 0, b:GetAttribute("Scale") or 0
 			if sa ~= sb then return sa > sb end
 			return (a:GetAttribute("TreeId") or 0) < (b:GetAttribute("TreeId") or 0)
+		end)
+	elseif mode == "Smart" then
+		table.sort(list, function(a, b)
+			local sa, sb = top_score(a), top_score(b)
+			if sa ~= sb then return sa > sb end
+			return dist(a) < dist(b)
 		end)
 	end
 	return list[1]
@@ -1171,10 +1300,11 @@ end
 
 S.sniping = false
 getgenv().__TopErr = nil
+local MAX_TOP_ROWS = 12
+local topLabel, topRows = nil, {}
 local okTop, errTop = pcall(function()
-	local topLabel = gbTop:CreateLabel("idle — live ranking")
-	local topRows = {}
-	for i = 1, 6 do
+	topLabel = gbTop:CreateLabel("idle — live ranking")
+	for i = 1, MAX_TOP_ROWS do
 		local row = {tree = nil}
 		topRows[i] = row
 		row.button = gbTop:CreateButton({
@@ -1205,6 +1335,9 @@ local okTop, errTop = pcall(function()
 				end)
 			end,
 		})
+		-- *hidden rows are destroyed rather than left blank, so shrinking the count
+		-- leaves no dead buttons between the last result and the controls below*
+		pcall(function() row.button:SetVisible(false) end)
 	end
 	getgenv().__TopRows = nil
 	getgenv().__TopRowsV2 = topRows
@@ -1561,6 +1694,74 @@ gbFarm:CreateDropdown({
 			if m == chosen then modeIndex = i end
 		end
 	end,
+})
+
+-- *the rarity floor: an Uncommon can no longer outrank a Mythic, because below-tier
+-- trees are dropped from the pool before anything is sorted*
+gbFarm:CreateDropdown({
+	Name = "Min rarity",
+	Flag = "MinRarity",
+	Options = MIN_RARITY_OPTIONS,
+	CurrentOption = MIN_RARITY_OPTIONS[(S.minTier or 0) + 1] or "Any",
+	Callback = function(sel)
+		local chosen = type(sel) == "table" and sel[1] or sel
+		local tier = 0
+		if chosen ~= "Any" then
+			tier = RARITY_TIER[chosen] or 0
+		end
+		S.minTier = tier
+	end,
+})
+
+gbFarm:CreateSlider({
+	Name = "Min value",
+	Range = {0, 100000},
+	Increment = 500,
+	CurrentValue = S.minValue or 0,
+	Suffix = "$",
+	Flag = "MinValue",
+	Callback = function(n) S.minValue = n end,
+})
+
+gbFarm:CreateDropdown({
+	Name = "Top sort",
+	Flag = "TopSort",
+	Options = {"Money", "Rarity", "Odds"},
+	CurrentOption = S.topSort or "Money",
+	Callback = function(sel)
+		local chosen = type(sel) == "table" and sel[1] or sel
+		S.topSort = (chosen == "Rarity" or chosen == "Odds") and chosen or "Money"
+	end,
+})
+
+gbFarm:CreateSlider({
+	Name = "Top rows",
+	Range = {3, 12},
+	Increment = 1,
+	CurrentValue = S.maxRows or 8,
+	Flag = "TopRows",
+	Callback = function(n) S.maxRows = n end,
+})
+
+-- *chance-vs-money dial: 0 chases raw $, 1 chases rarity, 0.6 is the balanced default*
+gbFarm:CreateSlider({
+	Name = "Chance vs money",
+	Range = {0, 100},
+	Increment = 5,
+	CurrentValue = math.floor((S.weightValue or 0.6) * 100),
+	Suffix = "%",
+	Flag = "WeightValue",
+	Callback = function(n) S.weightValue = (tonumber(n) or 60) / 100 end,
+})
+
+gbFarm:CreateSlider({
+	Name = "Refresh every",
+	Range = {1, 5},
+	Increment = 1,
+	CurrentValue = S.refreshRate or 1,
+	Suffix = "s",
+	Flag = "RefreshRate",
+	Callback = function(n) S.refreshRate = n end,
 })
 
 gbFarm:CreateToggle({
@@ -1926,30 +2127,35 @@ refresh_state()
 refresh_axe_info()
 refresh_ladder()
 
-local function top_wood_row_text(t, dist)
-	local wood = t:GetAttribute("Wood") or t.Name
-	local odds = math.floor(tree_odds(t) + 0.5)
-	local size = tree_size_label(t)
-	local muts = t:GetAttribute("Mutations")
-	local mutTxt = ""
-	if type(muts) == "table" then
-		local names = {}
-		for _, idx in ipairs(muts) do
-			local mi = mutation_info(idx)
-			if mi then names[#names+1] = mi.Name end
-		end
-		if #names > 0 then mutTxt = "  " .. table.concat(names, "+") end
-	end
-	local state = tostring(t:GetAttribute("State") or "?")
-	local d = dist and ("  %dm"):format(dist) or ""
-	if size ~= "" and size ~= "Normal" then
-		return ("%s  ·  1/%s  ·  %s  ·  %s%s  ·  %s%s"):format(
-			wood, odds, size, fmt_val(tree_price(t)), mutTxt, state, d)
-	end
-	return ("%s  ·  1/%s  ·  %s%s  ·  %s%s"):format(
-		wood, odds, fmt_val(tree_price(t)), mutTxt, state, d)
+local function fmt_odds(n)
+	if n >= 1e6 then return ("1/%.1fm"):format(n / 1e6) end
+	if n >= 1e3 then return ("1/%.0fk"):format(n / 1e3) end
+	return ("1/%d"):format(math.floor(n + 0.5))
 end
 
+-- *rows now lead with rarity and real money, because "1/N" alone made a 1-in-a-million
+-- $6 tree outrank a $10k Mythic — the exact "halusinasi" the Captain called out*
+local function top_wood_row_text(t, dist)
+	local wood = t:GetAttribute("Wood") or t:GetAttribute("Species") or t.Name
+	local rarity = tostring(t:GetAttribute("Rarity") or "?")
+	local money = tree_value(t, S.perfectOn)
+	local odds = tree_odds(t)
+	local size = t:GetAttribute("Size")
+	local sizeTxt = (size and size ~= "" and size ~= "Normal") and ("  " .. tostring(size)) or ""
+	local names = mutation_names(t)
+	local mutTxt = #names > 0 and ("  +" .. table.concat(names, "+")) or ""
+	local d = dist and ("  %dm"):format(dist) or ""
+	return ("%s · %s · %s · %s%s%s%s"):format(
+		rarity, fmt_val(money), wood, fmt_odds(odds), sizeTxt, mutTxt, d)
+end
+
+local function visible_top_rows()
+	local n = math.floor(tonumber(S.maxRows) or 8)
+	return math.clamp(n, 1, MAX_TOP_ROWS)
+end
+
+-- *the Captain asked for every-second refresh: the loop is now driven by S.refreshRate
+-- and re-sorts from live attributes, so a Mythic that just spawned climbs immediately*
 task.spawn(function()
 	local myToken = S.token
 	while alive() and S.token == myToken do
@@ -1957,35 +2163,63 @@ task.spawn(function()
 		local folder = workspace:FindFirstChild("Map") and workspace.Map:FindFirstChild("Trees")
 		if rows and folder then
 			local myRoot = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
+			local minTier = tonumber(S.minTier) or 0
+			local minValue = tonumber(S.minValue) or 0
 			local list = {}
 			for _, t in ipairs(folder:GetChildren()) do
-				if t:IsA("Model") and t:FindFirstChild("Trunk") and is_live(t) then
-					list[#list+1] = t
+				if t:IsA("Model") and t:FindFirstChild("Trunk") and is_live(t) and passes_rarity(t) then
+					local v = tree_value(t, S.perfectOn)
+					-- *sub-dollar trees are always junk regardless of the slider*
+					if v >= minValue and v >= 1 then
+						list[#list+1] = t
+					end
 				end
 			end
+			local sortMode = S.topSort
 			table.sort(list, function(a, b)
-				local oa, ob = tree_odds(a), tree_odds(b)
-				if oa ~= ob then return oa > ob end
-				return tree_price(a) > tree_price(b)
+				if sortMode == "Odds" then
+					local oa, ob = tree_odds(a), tree_odds(b)
+					if oa ~= ob then return oa > ob end
+					return tree_value(a, S.perfectOn) > tree_value(b, S.perfectOn)
+				elseif sortMode == "Rarity" then
+					local ta, tb = tier_of(a:GetAttribute("Rarity")), tier_of(b:GetAttribute("Rarity"))
+					if ta ~= tb then return ta > tb end
+					return tree_value(a, S.perfectOn) > tree_value(b, S.perfectOn)
+				else
+					local sa, sb = top_score(a), top_score(b)
+					if sa ~= sb then return sa > sb end
+					return tree_odds(a) > tree_odds(b)
+				end
 			end)
-			for i = 1, 6 do
+			local want = visible_top_rows()
+			for i = 1, MAX_TOP_ROWS do
 				local row = rows[i]
-				if row then
-					local t = list[i]
+				if not row then break end
+				local t = list[i]
+				local show = i <= want
+				pcall(function() row.button:SetVisible(show) end)
+				if not show then
+					row.tree = nil
+				else
 					row.tree = t
-					local d
-					if t and myRoot then
-						d = math.floor((t.Trunk.Position - myRoot.Position).Magnitude)
-					end
 					if t then
+						local d
+						if myRoot and t:FindFirstChild("Trunk") then
+							d = math.floor((t.Trunk.Position - myRoot.Position).Magnitude)
+						end
 						pcall(function() row.button:SetText(top_wood_row_text(t, d)) end)
 					else
-						pcall(function() row.button:SetText("-") end)
+						pcall(function() row.button:SetText("—") end)
 					end
 				end
 			end
+			if topLabel then
+				local mode = (S.topSort == "Odds" and "by odds") or (S.topSort == "Rarity" and "by rarity") or "by value"
+				safe_set(topLabel, ("%d shown · %d live · %s · %.1fs"):format(
+					math.min(want, #list), #list, mode, tonumber(S.refreshRate) or 1))
+			end
 		end
-		task.wait(2)
+		task.wait(math.clamp(tonumber(S.refreshRate) or 1, 0.25, 10))
 	end
 end)
 
