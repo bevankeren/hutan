@@ -2248,7 +2248,10 @@ task.spawn(function()
 					list[#list+1] = t
 				end
 			end
-			table.sort(list, function(a, b) return value_of(a) > value_of(b) end)
+			-- rank by the merchant's honest price (weight x rarity multiplier),
+			-- not the multiplier product — weight is the per-tree swing that
+			-- makes one Birch worth triple another
+			table.sort(list, function(a, b) return sell_value_of(a) > sell_value_of(b) end)
 			for i = 1, 6 do
 				local row = rows[i]
 				if row then
@@ -2258,13 +2261,13 @@ task.spawn(function()
 						local d = math.floor((t.Trunk.Position - myRoot.Position).Magnitude)
 						pcall(function() row.button:SetText(("%s  %s  %s  %dm"):format(
 							tostring(t:GetAttribute("Wood") or t.Name),
-							fmt_val(value_of(t)),
+							fmt_val(sell_value_of(t)),
 							tostring(t:GetAttribute("State") or "?"),
 							d)) end)
 					elseif t then
 						pcall(function() row.button:SetText(("%s  %s  %s"):format(
 							tostring(t:GetAttribute("Wood") or t.Name),
-							fmt_val(value_of(t)),
+							fmt_val(sell_value_of(t)),
 							tostring(t:GetAttribute("State") or "?"))) end)
 					else
 						pcall(function() row.button:SetText("-") end)
