@@ -1,4 +1,4 @@
--- Blizzard farm hub for Foresters — Airflow UI
+-- Blizzard farm hub for Foresters — OuroFlow UI (Airflow fork, joustingmatch/-3)
 -- features: stealth autofarm (attach + chop + hop) and axe auto-buy
 -- tree states / axe shop data are read from the game at runtime
 --
@@ -11,7 +11,10 @@
 ----------------------------------------------------------------------
 -- library + services
 ----------------------------------------------------------------------
-local Airflow = loadstring(game:HttpGet("https://raw.githubusercontent.com/PookiePepelsss/Airflow-UI/refs/heads/main/Source.luau"))()
+-- The fork adds native two-column groupboxes, self-refreshing statuses and
+-- rich-text labels, which replaces the old single-column tabs plus the
+-- compact_tab surgery this script used to perform on its own UI.
+local Airflow = loadstring(game:HttpGet("https://raw.githubusercontent.com/joustingmatch/-3/refs/heads/main/Source.luau"))()
 
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
@@ -160,6 +163,23 @@ S.perfectOn = S.perfectOn or false
 S.autoSell = S.autoSell or false
 S.sellAt = S.sellAt or 50
 S.logCount = S.logCount or 0
+-- ESP settings live here and are read by the loops every tick, so slider and
+-- dropdown changes apply without restarting any overlay
+S.esp = S.esp or {}
+do
+	local e = S.esp
+	e.players = e.players or false
+	e.trees = e.trees or false
+	e.merchants = e.merchants or false
+	e.maxDist = e.maxDist or 800
+	e.maxTags = e.maxTags or 22
+	e.textSize = e.textSize or 13
+	e.showRarity = e.showRarity ~= false
+	e.showMutations = e.showMutations ~= false
+	e.showDist = e.showDist ~= false
+	e.hideUnfellable = e.hideUnfellable or false
+	e.valueColor = e.valueColor or "Bands"
+end
 S.token += 1
 local MY_TOKEN = S.token
 S.farm = false
@@ -558,13 +578,17 @@ end
 -- none of it. One workspace Folder holds every instance, so unload is a single
 -- Destroy.
 --
--- Trees are tagged with billboards only: Roblox renders at most ~31 Highlight
--- instances at once, and a forest has far more trees than that. Labels carry
--- species, worth and distance, green when the held axe can fell it, red when
--- the island is beyond reach. Players get a full Highlight (players never
--- exceed the Highlight budget) plus a name+distance tag.
+-- Trees are tagged with rich-text billboards, never Highlights (Roblox renders
+-- at most ~31 Highlights at once and a forest has far more trees than that).
+-- Each tag reads the live game data: species in the rarity's own colour, worth
+-- in a money band (grey → lime → gold → pink as the price climbs), rarity,
+-- mutations by name, distance, and a red X when the held axe cannot fell the
+-- tree at all. Players get a Highlight plus a name+distance tag that turns red
+-- inside the panic radius. Merchants get gold tags. Every visual knob lives in
+-- S.esp and is read per tick, so UI changes land without restarting overlays.
 
-local ESP = {folder = nil, treeTags = {}, playerTags = {}, conns = {}}
+local ESP = {folder = nil, treeTags = {}, playerTags = {}, merchTags = {}, conns = {}, counts = {}}
+local espCfg = S.esp
 
 local function esp_ensure_folder()
 	if ESP.folder and ESP.folder.Parent then return ESP.folder end
@@ -589,26 +613,153 @@ local function esp_kill_highlights()
 	end
 end
 
-local function esp_make_billboard(name, adornee, text, color, widthPx)
+-- colour helpers ------------------------------------------------------------
+
+local rarColorCache = {}
+local function rarity_color(name)
+	if not name then return Color3.fromRGB(200, 200, 200) end
+	local c = rarColorCache[name]
+	if c then return c end
+	local ok, info = pcall(function() return WoodConfig.GetRarity(name) end)
+	c = (ok and type(info) == "table" and info.Color) or Color3.fromRGB(200, 200, 200)
+	rarColorCache[name] = c
+	return c
+end
+
+local mutCache
+local function mutation_info(idx)
+	if mutCache == nil then
+		mutCache = {}
+		pcall(function()
+			for k, v in pairs(WoodConfig.Mutations) do
+				if type(v) == "table" and v.Name then
+					mutCache[tonumber(k)] = {Name = tostring(v.Name), Color = v.Color}
+				end
+			end
+		end)
+	end
+	return mutCache[idx]
+end
+
+local function hex(c)
+	return ("#%02x%02x%02x"):format(
+		math.floor(c.R * 255 + 0.5),
+		math.floor(c.G * 255 + 0.5),
+		math.floor(c.B * 255 + 0.5))
+end
+
+local MUTED_HEX = "#9aa0a6"
+local DANGER_HEX = "#ff5a5a"
+local SHOP_HEX = "#ffcd40"
+
+-- money bands: the eye reads price classes faster than exact numbers, and the
+-- exact number is on the tag anyway
+local function value_band(v)
+	if v >= 100000 then return Color3.fromRGB(255, 90, 140) end
+	if v >= 10000 then return Color3.fromRGB(255, 205, 64) end
+	if v >= 1000 then return Color3.fromRGB(150, 235, 90) end
+	return Color3.fromRGB(210, 210, 210)
+end
+
+local function fmt_val(v)
+	if v >= 1e6 then return ("$%.2gm"):format(v / 1e6) end
+	if v >= 1e4 then return ("$%.0fk"):format(v / 1e3) end
+	if v >= 1e3 then return ("$%.1fk"):format(v / 1e3) end
+	return ("$%d"):format(math.floor(v))
+end
+
+-- billboard factory ----------------------------------------------------------
+
+local function esp_billboard(tagName, adornee, richText)
+	local wide = 178 + espCfg.textSize * 3
 	local bb = Instance.new("BillboardGui")
-	bb.Name = name
+	bb.Name = tagName
 	bb.Adornee = adornee
-	bb.Size = UDim2.fromOffset(widthPx, 42)
-	bb.StudsOffset = Vector3.new(0, 3.2, 0)
+	bb.Size = UDim2.fromOffset(wide, espCfg.textSize * 2 + 10)
+	bb.StudsOffset = Vector3.new(0, 3.4, 0)
 	bb.AlwaysOnTop = true
-	bb.MaxDistance = 700
+	bb.MaxDistance = espCfg.maxDist
 	local t = Instance.new("TextLabel")
+	t.Name = "Text"
 	t.BackgroundTransparency = 1
 	t.Size = UDim2.fromScale(1, 1)
-	t.Font = Enum.Font.GothamBold
-	t.TextScaled = true
-	t.Text = text
-	t.TextColor3 = color
-	t.TextStrokeTransparency = 0.2
+	t.Font = Enum.Font.GothamMedium
+	t.RichText = true
+	t.TextSize = espCfg.textSize
+	t.Text = richText
+	t.TextColor3 = Color3.fromRGB(235, 235, 235)
+	t.TextStrokeTransparency = 0.35
 	t.TextStrokeColor3 = Color3.new(0, 0, 0)
+	t.TextWrapped = false
 	t.Parent = bb
 	return bb
 end
+
+-- refresh an existing tag in place (text + size + range) instead of rebuilding
+local function esp_refresh_tag(bb, richText)
+	if not bb or not bb.Parent then return end
+	pcall(function()
+		bb.MaxDistance = espCfg.maxDist
+		local t = bb.Text
+		t.TextSize = espCfg.textSize
+		t.Text = richText
+	end)
+end
+
+-- tag text builders ----------------------------------------------------------
+
+local function esp_tree_text(t, dist, okFell)
+	local wood = t:GetAttribute("Wood") or t.Name
+	local rarity = t:GetAttribute("Rarity")
+	local rc = rarity_color(rarity)
+	local vc = (espCfg.valueColor == "Rarity") and rc or value_band(value_of(t))
+	local l1 = {}
+	l1[#l1+1] = ('<font color="%s">%s</font>'):format(hex(rc), wood)
+	l1[#l1+1] = ('<b><font color="%s">%s</font></b>'):format(hex(vc), fmt_val(value_of(t)))
+	if espCfg.showDist then
+		l1[#l1+1] = ('<font color="%s">%dm</font>'):format(MUTED_HEX, math.floor(dist))
+	end
+	local l2 = {}
+	if espCfg.showRarity and rarity then
+		l2[#l2+1] = ('<font color="%s">%s</font>'):format(hex(rc), rarity:sub(1, 4))
+	end
+	if espCfg.showMutations then
+		local muts = t:GetAttribute("Mutations")
+		if type(muts) == "table" then
+			for _, idx in ipairs(muts) do
+				local mi = mutation_info(idx)
+				if mi then
+					l2[#l2+1] = ('<font color="%s">%s</font>'):format(
+						hex(mi.Color or Color3.new(1, 1, 1)), mi.Name:sub(1, 5))
+				end
+			end
+		end
+	end
+	if not okFell then
+		l2[#l2+1] = ('<font color="%s">X no-axe</font>'):format(DANGER_HEX)
+	end
+	local line2 = table.concat(l2, " ")
+	return table.concat(l1, "  ") .. (line2 ~= "" and ("\n" .. line2) or "")
+end
+
+local function esp_player_text(p, dist)
+	local col = dist <= (S.panicRadius or 50) and DANGER_HEX or nil
+	local name = ('<b><font color="%s">%s</font></b>'):format(col or "#f2f2f2", p.DisplayName)
+	if espCfg.showDist then
+		return ("%s  <font color=\"%s\">%dm</font>"):format(name, MUTED_HEX, math.floor(dist))
+	end
+	return name
+end
+
+local function esp_merchant_text(dist, label)
+	local who = ('<b><font color="%s">%s</font></b>'):format(SHOP_HEX, label or "Merchant")
+	if espCfg.showDist then
+		return ("%s  <font color=\"%s\">%dm</font>"):format(who, MUTED_HEX, math.floor(dist))
+	end
+	return who
+end
+
+-- overlays -------------------------------------------------------------------
 
 local function esp_tag_player(p)
 	local char = p.Character
@@ -627,17 +778,16 @@ local function esp_tag_player(p)
 		hl.Parent = char
 	end
 	if not ESP.playerTags[p] then
-		local bb = esp_make_billboard("BlzPlayerTag", root, p.Name, Color3.fromRGB(255, 90, 90), 160)
+		local bb = esp_billboard("BlzPlayerTag", root, esp_player_text(p, 0))
 		bb.Parent = esp_ensure_folder()
 		ESP.playerTags[p] = bb
 	end
 end
 
 local function esp_players_loop(myToken)
-	-- keep tags aligned with join/leave/respawn while the toggle is on
 	table.insert(ESP.conns, game.Players.PlayerAdded:Connect(function()
 		task.wait(1)
-		if S.espPlayers and S.token == myToken then
+		if S.esp.players and S.token == myToken then
 			for _, p in ipairs(game.Players:GetPlayers()) do
 				if p ~= plr then esp_tag_player(p) end
 			end
@@ -650,43 +800,44 @@ local function esp_players_loop(myToken)
 	end))
 	table.insert(ESP.conns, plr.CharacterAdded:Connect(function()
 		task.wait(1)
-		if not (S.espPlayers and S.token == myToken) then return end
+		if not (S.esp.players and S.token == myToken) then return end
 		for _, p in ipairs(game.Players:GetPlayers()) do
 			if p ~= plr then esp_tag_player(p) end
 		end
 	end))
-	while S.espPlayers and S.token == myToken do
-		for _, p in ipairs(game.Players:GetPlayers()) do
-			if p ~= plr then esp_tag_player(p) end
-		end
-		-- distance refresh
+	while S.esp.players and S.token == myToken do
 		local myRoot = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
-		if myRoot then
-			for p, bb in pairs(ESP.playerTags) do
+		local seen = 0
+		for _, p in ipairs(game.Players:GetPlayers()) do
+			if p ~= plr then
+				esp_tag_player(p)
+				seen += 1
+				local bb = ESP.playerTags[p]
 				local r = p.Character and p.Character:FindFirstChild("HumanoidRootPart")
-				if r then
-					local d = math.floor((r.Position - myRoot.Position).Magnitude)
-					pcall(function() bb.TextLabel.Text = ("%s %dm"):format(p.Name, d) end)
+				if bb and myRoot and r then
+					local d = (r.Position - myRoot.Position).Magnitude
+					esp_refresh_tag(bb, esp_player_text(p, d))
 				end
 			end
 		end
+		ESP.counts.players = seen
 		task.wait(0.25)
 	end
 end
 
 local function esp_trees_loop(myToken)
-	while S.espTrees and S.token == myToken do
+	while S.esp.trees and S.token == myToken do
 		local myRoot = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
 		local folder = workspace:FindFirstChild("Map") and workspace.Map:FindFirstChild("Trees")
 		if myRoot and folder then
 			local axeSpec = current_axe_spec()
-			-- collect live trees, nearest first, then tag the closest N
 			local near = {}
+			local liveCount = 0
 			for _, t in ipairs(folder:GetChildren()) do
 				if t:IsA("Model") and t:FindFirstChild("Trunk") and is_live(t) then
-					local pp = t.Trunk
-					local d = (pp.Position - myRoot.Position).Magnitude
-					if d <= 800 then
+					liveCount += 1
+					local d = (t.Trunk.Position - myRoot.Position).Magnitude
+					if d <= espCfg.maxDist then
 						near[#near+1] = {t = t, d = d}
 					end
 				end
@@ -694,36 +845,78 @@ local function esp_trees_loop(myToken)
 			table.sort(near, function(a, b) return a.d < b.d end)
 			local keep, shown = {}, 0
 			for _, e in ipairs(near) do
-				if shown >= 22 then break end
+				if shown >= espCfg.maxTags then break end
+				local okFell = can_fell(e.t, axeSpec)
+				if espCfg.hideUnfellable and not okFell then
+					continue
+				end
 				keep[e.t] = true
 				shown += 1
+				local text = esp_tree_text(e.t, e.d, okFell)
 				local tag = ESP.treeTags[e.t]
-				local felled = e.t:GetAttribute("Felled")
-				local okFell = (not felled) and can_fell(e.t, axeSpec)
-				local label = ("%s $%d %dm%s"):format(
-					e.t.Name,
-					math.floor(value_of(e.t)),
-					math.floor(e.d),
-					felled and " X" or "")
 				if not tag or not tag.Parent then
-					tag = esp_make_billboard("BlzTreeTag", e.t.Trunk, label,
-						okFell and Color3.fromRGB(90, 255, 120) or Color3.fromRGB(255, 90, 90), 190)
+					tag = esp_billboard("BlzTreeTag", e.t.Trunk, text)
 					tag.Parent = esp_ensure_folder()
 					ESP.treeTags[e.t] = tag
 				else
-					pcall(function()
-						tag.TextLabel.Text = label
-						tag.TextLabel.TextColor3 = okFell and Color3.fromRGB(90, 255, 120) or Color3.fromRGB(255, 90, 90)
-					end)
+					esp_refresh_tag(tag, text)
 				end
 			end
-			-- drop tags whose tree left the nearest set or died
 			for t, tag in pairs(ESP.treeTags) do
 				if not keep[t] then
 					tag:Destroy()
 					ESP.treeTags[t] = nil
 				end
 			end
+			ESP.counts.trees = liveCount
+			ESP.counts.treeTags = shown
+		end
+		task.wait(1.5)
+	end
+end
+
+local function esp_merchants_loop(myToken)
+	while S.esp.merchants and S.token == myToken do
+		local myRoot = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
+		if myRoot then
+			local seen = {}
+			for _, d in ipairs(workspace:GetDescendants()) do
+				if d:IsA("Model") and d.Name:lower():match("merchant") and not seen[d] then
+					local ok, pos = pcall(function() return d:GetPivot().Position end)
+					if ok and pos then
+						seen[d] = true
+						local dist = (pos - myRoot.Position).Magnitude
+						if dist <= espCfg.maxDist then
+							local tag = ESP.merchTags[d]
+							-- the travelling merchant is the bare "Merchant" model
+							-- (the notice calls her Miku); permanent ones are
+							-- "<Name> the Merchant", so trim to the first name
+							local label = "Merchant"
+							if d.Name == "Merchant" then
+								label = "Miku"
+							elseif d.Name:match("^(.-) the Merchant$") then
+								label = d.Name:match("^(.-) the Merchant$")
+							end
+							local text = esp_merchant_text(dist, label)
+							if not tag or not tag.Parent then
+								tag = esp_billboard("BlzShopTag", d, text)
+								tag.Parent = esp_ensure_folder()
+								ESP.merchTags[d] = tag
+							else
+								esp_refresh_tag(tag, text)
+							end
+						end
+					end
+				end
+			end
+			for m, tag in pairs(ESP.merchTags) do
+				if not seen[m] then
+					tag:Destroy()
+					ESP.merchTags[m] = nil
+				end
+			end
+			ESP.counts.shops = 0
+			for _ in pairs(ESP.merchTags) do ESP.counts.shops += 1 end
 		end
 		task.wait(1.5)
 	end
@@ -731,26 +924,53 @@ end
 
 local function esp_apply(kind, on)
 	local myToken = S.token
+	local cfg = S.esp
 	if kind == "players" then
-		S.espPlayers = on
+		cfg.players = on
 		if on then
 			task.spawn(esp_players_loop, myToken)
 		else
 			for _, bb in pairs(ESP.playerTags) do pcall(function() bb:Destroy() end) end
 			table.clear(ESP.playerTags)
 			esp_kill_highlights()
+			ESP.counts.players = nil
 		end
 	elseif kind == "trees" then
-		S.espTrees = on
+		cfg.trees = on
 		if on then
 			task.spawn(esp_trees_loop, myToken)
 		else
 			for _, tag in pairs(ESP.treeTags) do pcall(function() tag:Destroy() end) end
 			table.clear(ESP.treeTags)
+			ESP.counts.trees = nil
+			ESP.counts.treeTags = nil
+		end
+	elseif kind == "merchants" then
+		cfg.merchants = on
+		if on then
+			task.spawn(esp_merchants_loop, myToken)
+		else
+			for _, tag in pairs(ESP.merchTags) do pcall(function() tag:Destroy() end) end
+			table.clear(ESP.merchTags)
+			ESP.counts.shops = nil
 		end
 	end
-	-- both overlays off: no reason to keep the join/leave/respawn listeners
-	if not S.espPlayers and not S.espTrees then esp_kill_conns() end
+	-- every overlay off: no reason to keep the join/leave/respawn listeners
+	if not cfg.players and not cfg.trees and not cfg.merchants then esp_kill_conns() end
+end
+
+local function esp_counts_text()
+	local c = ESP.counts
+	local f = ESP.folder
+	local tags = 0
+	if f then for _ in ipairs(f:GetChildren()) do tags += 1 end end
+	local bits = {}
+	bits[#bits+1] = ("tags <Accent>%d</Accent>"):format(tags)
+	if c.treeTags then bits[#bits+1] = ("trees <Accent>%d</Accent>"):format(c.trees or 0) end
+	if c.players then bits[#bits+1] = ("players <Accent>%d</Accent>"):format(c.players) end
+	if c.shops then bits[#bits+1] = ("shops <Accent>%d</Accent>"):format(c.shops) end
+	if #bits == 0 then return "<Muted>overlay off</Muted>" end
+	return table.concat(bits, "  ·  ")
 end
 
 -- Panic mode: true when another player is within radius of a position. Trees
@@ -1052,6 +1272,12 @@ local function buy_axe(axe)
 	return false, (type(res) == "table" and res.Reason) or "buy failed"
 end
 
+-- The ladder is built once at load: shop positions come from AxeView-tagged
+-- prompts and prices from AxePrice. The UI statuses below read it on their
+-- refresh timers, so it has to exist before the UI block.
+local ladder = axe_ladder()
+local axeRows = {}
+
 ----------------------------------------------------------------------
 -- ui
 ----------------------------------------------------------------------
@@ -1060,85 +1286,112 @@ local Window = Airflow:CreateWindow({
 	LoadingSubtitle = "Foresters",
 	Icon = "trees",
 	ToggleUIKeybind = "RightShift",
-	-- Fits inside a 758x393 viewport with the topbar inset accounted for.
-	-- At 430 tall the absolute height came to 370px, which together with the
-	-- 36px GuiInset exceeded the 393px screen, so centring pushed the window to
-	-- y=-46 and clipped the top off it.
 	Size = UDim2.fromOffset(760, 340),
+	Density = "Compact",
 	ConfigurationSaving = {Enabled = true, FolderName = "ForestersHub"},
-	Home = {Tier = "Dev", Features = true},
 })
 -- remember it so the next run unloads exactly this window and nothing else
 S.window = Window
 
--- Pin the window on screen.
---
--- Airflow centres it with AnchorPoint (0.5, 0) and a pixel-offset Position, and
--- on this 758x393 viewport the centring drives the top edge above the screen —
--- measured absY=-46, then -25, so the header sat clipped either way.
---
--- A single correction does not hold: Airflow re-centres on its own once the
--- content is built, which undid the first attempt. So re-apply it for a couple
--- of seconds until the layout settles.
-local function clamp_window()
-	local ok = pcall(function()
-		local main
-		for _, ch in ipairs(Window.Gui:GetChildren()) do
-			if ch:IsA("Frame") then main = ch break end
-		end
-		if not main then return end
-		local vp = workspace.CurrentCamera.ViewportSize
-
-		-- shrink first if it cannot fit, so the clamp has room to work
-		if main.AbsoluteSize.Y > vp.Y - 16 then
-			local k = (vp.Y - 16) / main.AbsoluteSize.Y
-			main.Size = UDim2.new(main.Size.X.Scale, main.Size.X.Offset * k,
-				main.Size.Y.Scale, main.Size.Y.Offset * k)
-			return
-		end
-
-		-- Position.Offset tracks AbsolutePosition one-to-one here, so nudge by
-		-- the measured error. X scale must stay 0 or the two stop corresponding.
-		local curAbsX, curAbsY = main.AbsolutePosition.X, main.AbsolutePosition.Y
-		local w = main.AbsoluteSize.X
-		local wantLeft = math.max(4, (vp.X - w) / 2)
-		local wantTop = 6
-		main.Position = UDim2.new(0,
-			main.Position.X.Offset + (wantLeft - curAbsX),
-			0, main.Position.Y.Offset + (wantTop - curAbsY))
-	end)
-	return ok
-end
-
--- The spawn that drives clamp_window lives at the end of the file. Run from
--- here it found no Frame yet (Window.Gui is not populated until the tabs are
--- built), so every attempt returned early and the window stayed off-screen.
+-- No clamp_window here any more. The old hack fought the original Airflow's
+-- centring with a reposition loop; the fork scales itself to the screen
+-- (AdaptiveSize) and keeps its own margins, so the fight is gone.
 
 local farmTab = Window:CreateTab({Name = "Farm", Icon = "tree-pine"})
 local axeTab = Window:CreateTab({Name = "Axes", Icon = "axe"})
 local legitTab = Window:CreateTab({Name = "Legit", Icon = "shield"})
+local espTab = Window:CreateTab({Name = "ESP", Icon = "eye"})
 
-farmTab:CreateSection({Name = "Farm"})
+-- Two columns are native in the fork: groupboxes dock Left/Right, which is
+-- what the old compact_tab surgery was imitating by hand.
+local gbFarm = farmTab:CreateGroupbox({Name = "Farming", Side = "Left"})
+local gbQuest = farmTab:CreateGroupbox({Name = "Quests", Side = "Left"})
+local gbSession = farmTab:CreateGroupbox({Name = "Session", Side = "Right"})
+local gbServer = farmTab:CreateGroupbox({Name = "Server", Side = "Right"})
+
+local gbAxes = axeTab:CreateGroupbox({Name = "Shop", Side = "Left"})
+local gbLadder = axeTab:CreateGroupbox({Name = "Buy ladder", Side = "Right"})
+local gbUtil = axeTab:CreateGroupbox({Name = "Utilities", Side = "Left"})
+
+local gbPerfect = legitTab:CreateGroupbox({Name = "Perfect", Side = "Left"})
+
+local gbEsp = espTab:CreateGroupbox({Name = "Overlay", Side = "Left"})
+local gbEspStyle = espTab:CreateGroupbox({Name = "Style", Side = "Right"})
+
+-- loop counters must exist before the UI closures below read them
+local stats = {felled = 0, failed = 0, startedAt = 0, blocked = {}}
+local modeIndex = 1
+local farmOn = false
+
+local function safe_set(label, text)
+	pcall(function() label:Set(text) end)
+end
+
 -- Labels carry bare values, not "state: idle" prose. The Captain wants the
 -- number, not a sentence around it.
-local stateLabel = farmTab:CreateLabel({Name = "idle"})
-local targetLabel = farmTab:CreateLabel({Name = "-"})
-local countLabel = farmTab:CreateLabel({Name = "0 / 0"})
-local rateLabel = farmTab:CreateLabel({Name = "0/min"})
+local stateLabel = gbFarm:CreateStatus({Name = "State", Style = "Dot", Value = "idle"})
+local targetLabel = gbFarm:CreateLabel("-")
+local countLabel = gbFarm:CreateStatus({Name = "Chopped", Style = "Row", Value = "0 / 0"})
+local rateLabel = gbFarm:CreateStatus({Name = "Rate", Style = "Row", Value = "0/min"})
 
-farmTab:CreateSection({Name = "Session"})
-local axeLabel = farmTab:CreateLabel({Name = "-"})
-local buckLabel = farmTab:CreateLabel({Name = "$0"})
+local axeLabel = gbSession:CreateStatus({Name = "Axe", Style = "Row", Value = "-"})
+local buckLabel = gbSession:CreateStatus({Name = "Bucks", Style = "Row", Value = "$0"})
+local sellLabel = gbSession:CreateLabel("off")
+local hopLabel = gbServer:CreateLabel("idle")
+local questLabel = gbQuest:CreateLabel("-")
 
-axeTab:CreateSection({Name = "Axes"})
-local buyLabel = axeTab:CreateLabel({Name = "off"})
-local buyLogLabel = axeTab:CreateLabel({Name = "-"})
-axeTab:CreateSection({Name = "Ladder"})
+local buyLabel = gbAxes:CreateStatus({Name = "Auto buy", Style = "Row", Value = "off"})
+local buyLogLabel = gbAxes:CreateLabel("-")
+-- live shop snapshot, refreshed by the fork's status timers (all reads are
+-- client-side: character scan, leaderstats, the prebuilt ladder table)
+gbAxes:CreateStatus({
+	Name = "Equipped",
+	Style = "Row",
+	UpdateRate = 2,
+	Update = function()
+		local eq = equipped_axe()
+		if not eq then return "none", "Muted" end
+		local cfg = AxeConfig[eq]
+		return (cfg and cfg.DisplayName or eq) .. "  P" .. tostring(cfg and cfg.Power or "?"), "Success"
+	end,
+})
+gbAxes:CreateStatus({
+	Name = "Owned",
+	Style = "Row",
+	UpdateRate = 2,
+	Update = function()
+		local n = 0
+		for _ in pairs(owned_axes()) do n += 1 end
+		return ("%d / %d"):format(n, #ladder)
+	end,
+})
+gbAxes:CreateStatus({
+	Name = "Next target",
+	Style = "Row",
+	UpdateRate = 2,
+	Update = function()
+		local own = owned_axes()
+		for _, axe in ipairs(ladder) do
+			if not own[axe.id] then
+				local b = bucks()
+				if b >= axe.price then
+					return ("%s $%d ready"):format(axe.name, axe.price), "Success"
+				end
+				return ("%s $%d · %d%% saved"):format(
+					axe.name, axe.price, math.floor(math.min(b / axe.price, 1) * 100)), "Warning"
+			end
+		end
+		return "ladder complete", "Success"
+	end,
+})
+local mikuLabel = gbUtil:CreateLabel("miku: not scanned yet")
 
-legitTab:CreateSection({Name = "Perfect"})
-local perfLabel = legitTab:CreateLabel({Name = "off"})
-legitTab:CreateToggle({
+local perfLabel = gbPerfect:CreateStatus({Name = "Auto Perfect", Style = "Row", Value = "off"})
+
+gbPerfect:CreateToggle({
 	Name = "Auto Perfect",
+	Flag = "AutoPerfect",
+	CurrentValue = false,
 	Callback = function(on)
 		S.perfectOn = on
 		if on then
@@ -1159,29 +1412,97 @@ legitTab:CreateToggle({
 	end,
 })
 
-local espTab = Window:CreateTab({Name = "ESP", Icon = "eye"})
-espTab:CreateSection({Name = "Overlay"})
 -- client-side only: Highlights + billboards, nothing replicates
-espTab:CreateToggle({
+gbEsp:CreateToggle({
 	Name = "Players",
+	Flag = "EspPlayers",
+	CurrentValue = false,
 	Callback = function(on)
 		esp_apply("players", on)
 	end,
 })
-espTab:CreateToggle({
+gbEsp:CreateToggle({
 	Name = "Trees",
+	Flag = "EspTrees",
+	CurrentValue = false,
 	Callback = function(on)
 		esp_apply("trees", on)
 	end,
 })
+gbEsp:CreateToggle({
+	Name = "Merchants",
+	Flag = "EspMerchants",
+	CurrentValue = false,
+	Callback = function(on)
+		esp_apply("merchants", on)
+	end,
+})
+gbEsp:CreateStatus({
+	Name = "Live",
+	Style = "Row",
+	Update = esp_counts_text,
+})
 
-local stats = {felled = 0, failed = 0, startedAt = 0, blocked = {}}
-local modeIndex = 1
-local farmOn = false
-
-local function safe_set(label, text)
-	pcall(function() label:Set(text) end)
-end
+-- style knobs are read by the loops every tick, so nothing needs restarting
+gbEspStyle:CreateSlider({
+	Name = "Max distance",
+	Range = {100, 1500},
+	Increment = 50,
+	CurrentValue = espCfg.maxDist,
+	Suffix = " studs",
+	Flag = "EspMaxDist",
+	Callback = function(n) espCfg.maxDist = n end,
+})
+gbEspStyle:CreateSlider({
+	Name = "Max tags",
+	Range = {5, 40},
+	Increment = 1,
+	CurrentValue = espCfg.maxTags,
+	Flag = "EspMaxTags",
+	Callback = function(n) espCfg.maxTags = n end,
+})
+gbEspStyle:CreateSlider({
+	Name = "Text size",
+	Range = {10, 18},
+	Increment = 1,
+	CurrentValue = espCfg.textSize,
+	Flag = "EspTextSize",
+	Callback = function(n) espCfg.textSize = n end,
+})
+gbEspStyle:CreateDropdown({
+	Name = "$ colour",
+	Flag = "EspValueColor",
+	Options = {"Bands", "Rarity"},
+	CurrentOption = espCfg.valueColor,
+	Callback = function(sel)
+		local chosen = type(sel) == "table" and sel[1] or sel
+		espCfg.valueColor = chosen == "Rarity" and "Rarity" or "Bands"
+	end,
+})
+gbEspStyle:CreateToggle({
+	Name = "Show rarity",
+	Flag = "EspRarity",
+	CurrentValue = espCfg.showRarity,
+	Callback = function(on) espCfg.showRarity = on end,
+})
+gbEspStyle:CreateToggle({
+	Name = "Show mutations",
+	Flag = "EspMutations",
+	CurrentValue = espCfg.showMutations,
+	Callback = function(on) espCfg.showMutations = on end,
+})
+gbEspStyle:CreateToggle({
+	Name = "Show distance",
+	Flag = "EspDist",
+	CurrentValue = espCfg.showDist,
+	Callback = function(on) espCfg.showDist = on end,
+})
+gbEspStyle:CreateToggle({
+	Name = "Hide unfellable",
+	Flag = "EspHideUnfellable",
+	CurrentValue = espCfg.hideUnfellable,
+	Callback = function(on) espCfg.hideUnfellable = on end,
+})
 
 local function refresh_axe_info()
 	local eq = equipped_axe()
@@ -1300,18 +1621,18 @@ local function set_farm(on)
 	refresh_state()
 end
 
-farmToggle = farmTab:CreateToggle({
+farmToggle = gbFarm:CreateToggle({
 	Name = "Auto Farm",
 	Flag = "AutoFarm",
 	CurrentValue = false,
 	Callback = function(on) set_farm(on) end,
 })
 
-farmTab:CreateDropdown({
+gbFarm:CreateDropdown({
 	Name = "Target class",
 	Flag = "TargetMode",
 	Options = MODES,
-	CurrentOption = {MODES[1]},
+	CurrentOption = MODES[1],
 	Callback = function(sel)
 		local chosen = type(sel) == "table" and sel[1] or sel
 		for i, m in ipairs(MODES) do
@@ -1334,27 +1655,27 @@ farmTab:CreateDropdown({
 -- produced failed=917 with felled=0, because the server validates the mark
 -- against the real minigame result. So the second FinishChop argument stays
 -- false and perfect chops stay a player skill.
+-- The Auto Perfect toggle now plays the real minigame path instead; see
+-- README_LEGIT.md.
 
-local panicLabel = farmTab:CreateLabel({Name = "off"})
-
-farmTab:CreateToggle({
+gbFarm:CreateToggle({
 	Name = "Panic Mode",
 	Flag = "PanicMode",
 	CurrentValue = false,
 	Callback = function(on)
 		S.panicOn = on
-		safe_set(panicLabel, on and "on" or "off")
 	end,
 })
 
-farmTab:CreateDropdown({
+gbFarm:CreateSlider({
 	Name = "Panic radius",
+	Range = {30, 150},
+	Increment = 5,
+	CurrentValue = S.panicRadius or 50,
+	Suffix = " studs",
 	Flag = "PanicRadius",
-	Options = {"30", "50", "80", "120"},
-	CurrentOption = {"50"},
-	Callback = function(sel)
-		local chosen = type(sel) == "table" and sel[1] or sel
-		S.panicRadius = tonumber(chosen) or 50
+	Callback = function(n)
+		S.panicRadius = n
 	end,
 })
 
@@ -1421,9 +1742,7 @@ local function auto_sell_pass()
 	return false, lastWhy
 end
 
-local sellLabel = farmTab:CreateLabel({Name = "off"})
-
-farmTab:CreateToggle({
+gbSession:CreateToggle({
 	Name = "Auto Sell",
 	Flag = "AutoSell",
 	CurrentValue = false,
@@ -1433,19 +1752,20 @@ farmTab:CreateToggle({
 	end,
 })
 
-farmTab:CreateDropdown({
+gbSession:CreateSlider({
 	Name = "Sell at logs",
+	Range = {10, 200},
+	Increment = 10,
+	CurrentValue = S.sellAt or 50,
+	Suffix = " logs",
 	Flag = "SellAt",
-	Options = {"10", "25", "50", "100", "200"},
-	CurrentOption = {"50"},
-	Callback = function(sel)
-		local chosen = type(sel) == "table" and sel[1] or sel
-		S.sellAt = tonumber(chosen) or 50
-		if S.autoSell then safe_set(sellLabel, "at " .. tostring(S.sellAt)) end
+	Callback = function(n)
+		S.sellAt = n
+		if S.autoSell then safe_set(sellLabel, "at " .. tostring(n)) end
 	end,
 })
 
-farmTab:CreateButton({
+gbSession:CreateButton({
 	Name = "Sell now",
 	Callback = function()
 		task.spawn(function()
@@ -1455,18 +1775,18 @@ farmTab:CreateButton({
 	end,
 })
 
-farmTab:CreateSection({Name = "Server"})
-farmTab:CreateButton({
+gbServer:CreateButton({
 	Name = "Hop to low server",
 	Callback = function()
 		task.spawn(function()
 			local msg = hop_to_low_server()
 			-- the teleport, when it happens, disconnects us within a second —
 			-- still show where we were headed so a fail is readable
-			pcall(function() stateLabel:Set(msg) end)
+			safe_set(hopLabel, msg)
 		end)
 	end,
 })
+gbServer:CreateLabel("server listed via games API")
 
 ----------------------------------------------------------------------
 -- quests
@@ -1515,8 +1835,7 @@ local function claim_all_quests()
 	safe_set(questLabel, msg)
 end
 
-local questLabel = farmTab:CreateLabel({Name = "-"})
-farmTab:CreateButton({
+gbQuest:CreateButton({
 	Name = "Claim all quests",
 	Callback = function()
 		task.spawn(function() claim_all_quests() end)
@@ -1526,22 +1845,24 @@ farmTab:CreateButton({
 ----------------------------------------------------------------------
 -- axe ladder ui
 ----------------------------------------------------------------------
-local ladder = axe_ladder()
-local axeRows = {}
 local autobuyOn = false
 
+-- owned axes get disabled so the ladder reads as a progress bar: greyed rows
+-- behind you, live rows ahead
 local function refresh_ladder()
 	local own = owned_axes()
 	local eq = equipped_axe()
 	for _, row in ipairs(axeRows) do
-		local tag = own[row.axe.id] and (eq == row.axe.id and "  [equipped]" or "  [owned]") or ""
+		local isOwned = own[row.axe.id] == true
+		local tag = isOwned and (eq == row.axe.id and "  [equipped]" or "  [owned]") or ""
 		row.button:SetText(("%s  $%d  power %.1f%s"):format(row.axe.name, row.axe.price, row.axe.power, tag))
+		pcall(function() row.button:SetDisabled(isOwned) end)
 	end
 	refresh_axe_info()
 end
 
 for _, axe in ipairs(ladder) do
-	local button = axeTab:CreateButton({
+	local button = gbLadder:CreateButton({
 		Name = ("%s  $%d  power %.1f"):format(axe.name, axe.price, axe.power),
 		Callback = function()
 			task.spawn(function()
@@ -1566,7 +1887,7 @@ local function next_target()
 	return nil
 end
 
-axeTab:CreateToggle({
+gbAxes:CreateToggle({
 	Name = "Auto buy next affordable",
 	Flag = "AutoBuy",
 	CurrentValue = false,
@@ -1593,7 +1914,7 @@ axeTab:CreateToggle({
 	end,
 })
 
-axeTab:CreateButton({
+gbAxes:CreateButton({
 	Name = "Equip best owned axe",
 	Callback = function()
 		task.spawn(function()
@@ -1616,13 +1937,31 @@ axeTab:CreateButton({
 ----------------------------------------------------------------------
 -- Miku teleport
 ----------------------------------------------------------------------
--- Miku is an NPC that only spawns occasionally, so a scan at load time finds
--- nothing. The search runs when the button is pressed, not when the script
--- loads. It checks live players first (cheap), then walks workspace for a
--- spawned Miku model or part.
+-- Miku is the travelling merchant. Verified live: her rig is parked as a
+-- Model literally named "Merchant" directly under workspace.Map.NPCs while
+-- her visit lasts (Humanoid + R6 parts + TalkPrompt), and the join notice
+-- calls her Miku — the model itself never carries that name. The permanent
+-- island merchants are named "<Name> the Merchant", so the exact child name
+-- "Merchant" is unambiguous. A player named Miku is also accepted, and the
+-- old workspace-wide name scan stays as a last resort.
 ----------------------------------------------------------------------
 local function find_miku()
-	-- a player named Miku wins: they move, so teleport to their live position
+	-- the join notice calls her Miku, but the rig is named "Merchant".
+	-- Verified live: one Model named "Merchant" sits directly under
+	-- workspace.Map.NPCs while her visit lasts (R6 + HumanoidRootPart +
+	-- TalkPrompt); permanent shops are "<Name> the Merchant", so the exact
+	-- name is unambiguous.
+	local npcs = workspace:FindFirstChild("Map") and workspace.Map:FindFirstChild("NPCs")
+	if npcs then
+		local m = npcs:FindFirstChild("Merchant")
+		if m and m:IsA("Model") then
+			local root = m:FindFirstChild("HumanoidRootPart")
+			if root then return root.Position, "Miku (travelling merchant)" end
+			local ok, pos = pcall(function() return m:GetPivot().Position end)
+			if ok and pos then return pos, "Miku (travelling merchant)" end
+		end
+	end
+	-- a player named Miku wins too: they move, so teleport to their live position
 	for _, p in ipairs(game.Players:GetPlayers()) do
 		if p ~= plr
 			and (string.lower(p.Name):match("miku") or string.lower(p.DisplayName):match("miku")) then
@@ -1655,10 +1994,7 @@ local function teleport_to(pos, offset)
 	return true
 end
 
-local mikuLabel
-mikuLabel = axeTab:CreateLabel({Text = "miku: not scanned yet"})
-
-axeTab:CreateButton({
+gbUtil:CreateButton({
 	Name = "TP to Miku",
 	Callback = function()
 		task.spawn(function()
@@ -1673,7 +2009,7 @@ axeTab:CreateButton({
 	end,
 })
 
-axeTab:CreateParagraph({
+gbAxes:CreateParagraph({
 	Title = "How buying works",
 	Content = "The server rejects purchases unless you are standing at the shop, so auto buy travels to the axe's island stall first.",
 })
@@ -1752,228 +2088,6 @@ getgenv().ForestFarm = {
 refresh_state()
 refresh_axe_info()
 refresh_ladder()
-
-----------------------------------------------------------------------
--- compact layout
-----------------------------------------------------------------------
--- Tried splitting the tab into two columns. Measured result: the window is only
--- 339px wide on this device, so each column ended up 144px — narrower than a
--- single readable control, which read as cramped and stacked. Two columns are a
--- downgrade at phone width. Reverted to one column and tightened the vertical
--- rhythm instead, which is what actually made it look heavy.
---
--- Removes leftover split artifacts if an older run created them.
-local function compact_tab(tabName)
-	local win = S.window
-	if not win or not win.Content then return false end
-	local tab = win.Content:FindFirstChild(tabName)
-	if not tab then return false end
-	local scroll
-	for _, ch in ipairs(tab:GetChildren()) do
-		if ch:IsA("ScrollingFrame") then scroll = ch break end
-	end
-	if not scroll then return false end
-
-	-- undo any columns from an earlier version: lift their rows back out
-	for _, col in ipairs({scroll:FindFirstChild("ColLeft"), scroll:FindFirstChild("ColRight")}) do
-		if col then
-			for _, row in ipairs(col:GetChildren()) do
-				if row:IsA("Frame") or row:IsA("TextLabel") or row:IsA("TextButton") then
-					row.Parent = scroll
-				end
-			end
-			col:Destroy()
-		end
-	end
-
-	local rows = {}
-	for _, ch in ipairs(scroll:GetChildren()) do
-		if ch:IsA("Frame") or ch:IsA("TextLabel") or ch:IsA("TextButton") then
-			table.insert(rows, ch)
-		end
-	end
-	if #rows < 4 then return false end
-	for _, row in ipairs(rows) do row.Parent = nil end
-
-	-- Kill Airflow's own list layout. It forces every child into one vertical
-	-- stack and overrides any Position we set, which is why the first attempt
-	-- looked like "everything on the left" — the columns were placed correctly
-	-- but the parent's UIListLayout re-stacked them anyway.
-	local oldLay = scroll:FindFirstChildOfClass("UIListLayout")
-	if oldLay then oldLay:Destroy() end
-
-	-- Airflow's scroll padding is L=24 R=24. On a 339px scroller that is 48px
-	-- — 14% of the width — and it silently ate the space the second column
-	-- needed, so the columns overlapped by ~11px. Reclaim it.
-	local pad = scroll:FindFirstChildOfClass("UIPadding")
-	if pad then
-		pad.PaddingLeft = UDim.new(0, 4)
-		pad.PaddingRight = UDim.new(0, 4)
-		pad.PaddingTop = UDim.new(0, 4)
-		pad.PaddingBottom = UDim.new(0, 4)
-	end
-
-	-- Column maths, done against the width that is actually usable.
-	-- With gutter g and usable width W: each column is (W-g)/2, the left sits
-	-- at 0, the right at (W+g)/2. Expressed in scale so the split survives any
-	-- window size, and with the gutter subtracted in pixels so it never
-	-- collapses to zero on a narrow screen.
-	local gutter = 14
-	local colW = UDim.new(0.5, -gutter / 2)
-	local rightX = UDim.new(0.5, gutter / 2)
-
-	local function makeCol(name, x)
-		local col = Instance.new("Frame")
-		col.Name = name
-		col.BackgroundTransparency = 1
-		col.Size = UDim2.new(colW.Scale, colW.Offset, 0, 0)
-		col.Position = UDim2.new(x.Scale, x.Offset, 0, 0)
-		col.Parent = scroll
-		local lay = Instance.new("UIListLayout")
-		lay.SortOrder = Enum.SortOrder.LayoutOrder
-		lay.Padding = UDim.new(0, 6)
-		lay.Parent = col
-		return col
-	end
-	local left = makeCol("ColLeft", UDim.new(0, 0))
-	local right = makeCol("ColRight", rightX)
-
-	-- Group by section, not by row. Alternating per row tore sections in half:
-	-- measured "SESSION" heading landing in the right column while its labels
-	-- sat in the left. A heading has to stay with the controls under it.
-	local function isHeading(row)
-		if not row:IsA("TextLabel") and not row:IsA("Frame") then return false end
-		for _, d in ipairs(row:GetDescendants()) do
-			if d:IsA("TextLabel") and d.Text ~= "" then
-				return d.Text == string.upper(d.Text) and #d.Text < 24
-			end
-		end
-		return false
-	end
-
-	local groups, current = {}, nil
-	for _, row in ipairs(rows) do
-		if isHeading(row) then
-			current = {heading = row, items = {}}
-			table.insert(groups, current)
-		elseif current then
-			table.insert(current.items, row)
-		else
-			if not groups[1] then table.insert(groups, {heading = nil, items = {}}) end
-			table.insert(groups[1].items, row)
-		end
-	end
-
-	-- balance: whichever column is shorter takes the next section
-	local function height(col)
-		local y = 0
-		for _, ch in ipairs(col:GetChildren()) do
-			if ch:IsA("Frame") or ch:IsA("TextLabel") or ch:IsA("TextButton") then
-				y += (ch.AbsoluteSize.Y > 0 and ch.AbsoluteSize.Y or 30) + 6
-			end
-		end
-		return y
-	end
-
-	local order = 0
-	local function place(row, col)
-		order += 1
-		row.LayoutOrder = order
-		-- Width only. Forcing the height clamped every row into 24-32px, and
-		-- Airflow's dropdowns are taller than that — the header got crushed and
-		-- the option list spilled over the row below, which is the collision the
-		-- Captain kept hitting. Their natural height is correct as built.
-		row.Size = UDim2.new(1, 0, row.Size.Y.Scale, row.Size.Y.Offset)
-		row.ClipsDescendants = false
-		row.Parent = col
-	end
-	local function colHeight(col)
-		local y = 0
-		for _, ch in ipairs(col:GetChildren()) do
-			if ch:IsA("Frame") or ch:IsA("TextLabel") or ch:IsA("TextButton") then
-				y += (ch.AbsoluteSize.Y > 0 and ch.AbsoluteSize.Y or 30) + 6
-			end
-		end
-		return y
-	end
-
-	-- Small sections stay whole — a heading torn away from its controls was the
-	-- earlier complaint. Anything long enough to unbalance the columns (the axe
-	-- ladder is 12 rows on its own, which produced a 4/15 split) is poured in
-	-- one row at a time into whichever column is currently shorter.
-	local WHOLE_LIMIT = 4
-	for _, group in ipairs(groups) do
-		if #group.items <= WHOLE_LIMIT then
-			local target = (colHeight(left) <= colHeight(right)) and left or right
-			if group.heading then place(group.heading, target) end
-			for _, item in ipairs(group.items) do place(item, target) end
-		else
-			local first = true
-			for _, item in ipairs(group.items) do
-				local target = (colHeight(left) <= colHeight(right)) and left or right
-				if first and group.heading then
-					-- the heading rides with the first row it introduces
-					place(group.heading, target)
-					first = false
-				end
-				place(item, target)
-			end
-		end
-	end
-
-	task.defer(function()
-		local function fit(col)
-			local y = 0
-			for _, ch in ipairs(col:GetChildren()) do
-				if ch:IsA("Frame") or ch:IsA("TextLabel") or ch:IsA("TextButton") then
-					y += ch.AbsoluteSize.Y + 6
-				end
-			end
-			col.Size = UDim2.new(colW.Scale, colW.Offset, 0, y)
-			return y
-		end
-		local ly, ry = fit(left), fit(right)
-		scroll.CanvasSize = UDim2.new(0, 0, 0, math.max(ly, ry) + 8)
-	end)
-	return true
-end
-
-task.defer(function()
-	pcall(function() compact_tab("Farm") end)
-	pcall(function() compact_tab("Axes") end)
-	pcall(function() compact_tab("Legit") end)
-end)
-
--- Drive the on-screen clamp from here, once every tab and control exists.
--- Verified against the live client: applied this way it holds at absY=6 for at
--- least six seconds, i.e. Airflow does not re-centre afterwards. It retries
--- because the Frame takes a moment to appear even at this point.
-task.spawn(function()
-	-- No early break. The loop used to stop at the first pass that measured
-	-- absY=6, which happened before the tabs finished building; Airflow's own
-	-- layout pass then re-centred the window and the clamp was gone. Reapply
-	-- through the whole build window instead.
-	for _ = 1, 40 do
-		pcall(function()
-			local main = Window.Gui:FindFirstChild("Window")
-			if not (main and main:IsA("Frame")) then return end
-			local vp = workspace.CurrentCamera.ViewportSize
-			if main.AbsoluteSize.Y > vp.Y - 16 then
-				local k = (vp.Y - 16) / main.AbsoluteSize.Y
-				main.Size = UDim2.new(main.Size.X.Scale, main.Size.X.Offset * k,
-					main.Size.Y.Scale, main.Size.Y.Offset * k)
-				return
-			end
-			local curAbsX, curAbsY = main.AbsolutePosition.X, main.AbsolutePosition.Y
-			local wantLeft = math.max(4, (vp.X - main.AbsoluteSize.X) / 2)
-			main.Position = UDim2.new(main.Position.X.Scale,
-				main.Position.X.Offset + (wantLeft - curAbsX),
-				main.Position.Y.Scale,
-				main.Position.Y.Offset + (6 - curAbsY))
-		end)
-		task.wait(0.3)
-	end
-end)
 
 pcall(function()
 	Window:Notify({Title = "Blizzard", Content = "Farm hub ready", Duration = 4})
