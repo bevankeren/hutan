@@ -1427,7 +1427,7 @@ local panicLabel = gbFarm:CreateStatus({
 		if d <= (S.panicRadius or 50) then
 			return ("! %s %dm"):format(who and who.DisplayName or "?", math.floor(d)), "Error"
 		end
-		return "%dm":format(math.floor(d)), "Success"
+		return ("%dm"):format(math.floor(d)), "Success"
 	end,
 })
 
