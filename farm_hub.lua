@@ -1,19 +1,4 @@
--- Blizzard farm hub for Foresters — OuroFlow UI (Airflow fork, joustingmatch/-3)
--- features: stealth autofarm (attach + chop + hop) and axe auto-buy
--- tree states / axe shop data are read from the game at runtime
---
--- Re-running this file UNLOADS the previous copy first: the old UI is destroyed,
--- its loops are signalled dead, and the character is handed back in a normal
--- state. Without that, stacked copies keep moving the same character and the
--- stale loops fight the new one, which shows up as phantom hops and chops that
--- never land.
 
-----------------------------------------------------------------------
--- library + services
-----------------------------------------------------------------------
--- The fork adds native two-column groupboxes, self-refreshing statuses and
--- rich-text labels, which replaces the old single-column tabs plus the
--- compact_tab surgery this script used to perform on its own UI.
 local Airflow = loadstring(game:HttpGet("https://raw.githubusercontent.com/joustingmatch/-3/refs/heads/main/Source.luau"))()
 
 local Players = game:GetService("Players")
@@ -34,19 +19,6 @@ local AxeConfig = require(RS.Modules.Lumber.AxeConfig)
 local AxePrice = require(RS.Modules.Lumber.AxePrice)
 local ChopTuning = require(RS.Modules.Lumber.ChopTuning)
 
-----------------------------------------------------------------------
--- auto perfect (Legit tab)
-----------------------------------------------------------------------
--- The chop minigames (Chop / Swing / Notch) are client-side simulations. Each
--- ends in onFinish(done, perfect), and ChopController forwards those straight
--- into TreeService:FinishChop(tree, done, perfect) — the server trusts the
--- claimed perfect flag. Verified live: a call sent as FinishChop(tree, true,
--- false) through this wrapper comes back Ok=true, Felled=true.
---
--- The wrapper only upgrades a *successful* chop (done=true) to perfect. Failed
--- chops (done=false, "the tree held on") pass through untouched, so the feature
--- reads as playing the minigame well rather than felling trees that were never
--- cut. Toggling off or unloading restores the original method.
 local PERF_KEY = "__BlizzardPerfHook"
 
 local function perfect_hook_install()
@@ -67,7 +39,6 @@ end
 local function perfect_hook_remove()
 	local state = getgenv()[PERF_KEY]
 	if not state then return false end
-	-- only restore if nobody stacked another wrapper on top of ours
 	if TreeService.FinishChop == state.old or type(state.old) == "function" then
 		pcall(function() TreeService.FinishChop = state.old end)
 	end
@@ -79,14 +50,9 @@ local function perfect_hook_active()
 	return getgenv()[PERF_KEY] ~= nil
 end
 
-----------------------------------------------------------------------
--- unload any previous run
-----------------------------------------------------------------------
 do
 	local prev = getgenv().__ForestFarmState
 	if prev then
-		-- flip the token so any live loop from the previous copy exits on its
-		-- next check, then stop its work flags outright
 		prev.token = (prev.token or 0) + 1
 		prev.farm = false
 		prev.autobuy = false
@@ -96,7 +62,6 @@ do
 			pcall(old.stop)
 		end
 	end
-	-- undo the auto-perfect wrapper so the next run hooks a clean method
 	pcall(function()
 		local state = getgenv().__BlizzardPerfHook
 		if state and type(state.old) == "function" then
@@ -104,23 +69,14 @@ do
 		end
 		getgenv().__BlizzardPerfHook = nil
 	end)
-	-- tear down ONLY the window this script created. Destroying every ScreenGui
-	-- here used to wipe the player's own HUD (on mobile especially), because the
-	-- game's interface lives in ScreenGuis of its own. We now keep a reference to
-	-- our window and remove exactly that.
 	if prev and prev.window and typeof(prev.window) ~= "nil" then
 		pcall(function() prev.window:Destroy() end)
 	end
-	-- wipe the ESP overlay: the folder holds tree/player billboards, highlights
-	-- ride on characters and get swept by name. (Inline, not esp_teardown — that
-	-- local is declared later and would resolve to nil here.)
 	local espFolderOld = workspace:FindFirstChild("BlizzardESP")
 	if espFolderOld then pcall(function() espFolderOld:Destroy() end) end
 	for _, d in ipairs(workspace:GetDescendants()) do
 		if d:IsA("Highlight") and d.Name == "BlzPlayerHL" then pcall(function() d:Destroy() end) end
 	end
-	-- belt-and-braces fallback: if the window reference was lost, remove any
-	-- ScreenGui whose name matches Airflow's window naming, and nothing else.
 	local gui = plr:FindFirstChild("PlayerGui")
 	if gui then
 		for _, g in ipairs(gui:GetChildren()) do
@@ -129,7 +85,6 @@ do
 			end
 		end
 	end
-	-- hand the character back in a normal state
 	local char = plr.Character
 	if char then
 		local root = char:FindFirstChild("HumanoidRootPart")
@@ -149,9 +104,6 @@ do
 	task.wait(0.25)
 end
 
-----------------------------------------------------------------------
--- shared state (a re-run must kill every previous loop)
-----------------------------------------------------------------------
 local S = getgenv().__ForestFarmState
 if not S then
 	S = {token = 0, farm = false, autobuy = false, panicOn = false, panicRadius = 50, perfectOn = false}
@@ -163,8 +115,6 @@ S.perfectOn = S.perfectOn or false
 S.autoSell = S.autoSell or false
 S.sellAt = S.sellAt or 50
 S.logCount = S.logCount or 0
--- ESP settings live here and are read by the loops every tick, so slider and
--- dropdown changes apply without restarting any overlay
 S.esp = S.esp or {}
 do
 	local e = S.esp
@@ -190,9 +140,6 @@ local function alive()
 	return S.token == MY_TOKEN
 end
 
-----------------------------------------------------------------------
--- character / stealth
-----------------------------------------------------------------------
 local savedCollide = setmetatable({}, {__mode = "k"})
 local noclipOn = false
 
@@ -200,8 +147,6 @@ local function set_prop(part, prop, value, ok)
 	pcall(function() part[prop] = value end)
 end
 
--- one pass is not enough: the Humanoid re-solidifies parts while grounded,
--- so this is driven from RenderStepped while the farm runs
 local function noclip_pass()
 	local char = plr.Character
 	if not char then return end
@@ -213,7 +158,6 @@ local function noclip_pass()
 	end
 	local hum = char:FindFirstChildOfClass("Humanoid")
 	if hum then
-		-- stop the engine from re-grounding us through terrain
 		for _, st in ipairs({
 			Enum.HumanoidStateType.Landed,
 			Enum.HumanoidStateType.FallingDown,
@@ -249,30 +193,11 @@ local function hrp()
 	return char and char:FindFirstChild("HumanoidRootPart") or nil
 end
 
--- Where to stand while chopping.
---
--- Grounded, a few studs off the trunk, facing it. That is the only arrangement
--- verified end to end: StartChop ok -> FinishChop ok -> state=Felled.
---
--- The character is deliberately NOT anchored. The server rejects StartChop from
--- an anchored position — every anchored attempt was refused with "Get closer to
--- the tree" at a correct 5-stud distance, while the same spot with a free
--- character went through. So: set the CFrame, zero the velocity, ask at once.
---
--- Note the reach gate is measured against the pivot HORIZONTALLY, and the game's
--- own ChopLeash yanks the character back to the reach boundary every frame
--- anyway, so standing further out is pointless: the leash pulls you in.
 local HUG_OFFSET = 5
 local STAND_HEIGHT = 1
 
 local attachYaw = 0
 
--- Moving an anchored part does not replicate, so the server's reach check keeps
--- seeing the OLD position. Releasing the anchor and waiting lets physics drag us
--- off instead. The sequence that works is: unanchor, set CFrame, zero velocity,
--- then ask immediately with no yield in between.
---
--- Collisions are deliberately left ALONE. No-clip is what the server rejects.
 local function attach(tree, anchor, reroll)
 	local root = hrp()
 	if not root or not tree or not tree.Parent then return end
@@ -284,7 +209,6 @@ local function attach(tree, anchor, reroll)
 	root.CFrame = facing
 	root.AssemblyLinearVelocity = Vector3.zero
 	root.AssemblyAngularVelocity = Vector3.zero
-	-- never anchor: an anchored root is refused by the server's reach check
 end
 
 local function set_anchored(state)
@@ -292,8 +216,6 @@ local function set_anchored(state)
 	if root then root.Anchored = state end
 end
 
--- keep a tool in hand; the server rejects chops otherwise.
--- anchoring drops the tool, so this must run AFTER any anchor change
 local function equip_axe()
 	local char = plr.Character
 	if not char then return false end
@@ -320,23 +242,12 @@ local function equip_axe()
 	return held()
 end
 
--- tools also drop on teleport/respawn; re-equip right before every chop
 local function ensure_axe_for_chop()
 	if equip_axe() then return true end
 	task.wait(0.15)
 	return equip_axe()
 end
 
-----------------------------------------------------------------------
--- promise bridge
-----------------------------------------------------------------------
--- Knit methods normally return a Promise, but not always: a call can resolve to
--- a plain value, or hand back an Instance (StartChop answering with the tree),
--- and calling :andThen on one of those raises
---   "Trying to call method on object of type: `Model` with incorrect arguments"
--- at hundreds of times a second inside the farm loop. So accept anything: use
--- andThen when it exists, otherwise treat the value as the settled result, and
--- treat a thrown call as a failure instead of killing the loop.
 local function await(promise, timeout)
 	if promise == nil then return {Ok = false, Reason = "nil result"} end
 	if type(promise) ~= "table" and typeof(promise) ~= "Instance" then
@@ -344,7 +255,6 @@ local function await(promise, timeout)
 	end
 	if promise.Ok ~= nil then return promise end
 	if type(promise.andThen) ~= "function" then
-		-- already a plain value/instance: that IS the answer
 		return {Ok = true, Value = promise}
 	end
 
@@ -359,7 +269,6 @@ local function await(promise, timeout)
 		end)
 	end)
 	if not ok then
-		-- not actually a promise after all
 		return {Ok = true, Value = promise}
 	end
 
@@ -372,7 +281,6 @@ local function await(promise, timeout)
 	return result
 end
 
--- same idea, but also survives the call itself throwing
 local function call(service, method, ...)
 	local args = {...}
 	local ok, res = pcall(function()
@@ -382,9 +290,6 @@ local function call(service, method, ...)
 	return await(res)
 end
 
-----------------------------------------------------------------------
--- trees
-----------------------------------------------------------------------
 local WoodConfig = require(RS.Modules.Lumber.WoodConfig)
 local tierCache = {}
 local function rarity_info(rarity)
@@ -398,9 +303,6 @@ local function tier_of(rarity)
 	return rarity_info(rarity).Tier or 0
 end
 
--- what a tree is actually worth: the game scales value by the rarity multiplier
--- (1 for Common up to 1500 for Secret), then by size, then mutations on top.
--- Rarer really does mean more money, so this is the ranking that pays.
 local function value_of(tree)
 	local info = rarity_info(tree:GetAttribute("Rarity"))
 	local mult = info.ValueMultiplier or 1
@@ -413,9 +315,6 @@ local function value_of(tree)
 	return mult * scale * mutBonus
 end
 
--- What the merchant pays for a felled tree: weight scaled by the rarity
--- multiplier. TreeFelled reports Value alongside Weight, and Value is what the
--- sell screens use, so Weight x ValueMultiplier is the honest ranking.
 local function sell_value_of(tree)
 	local info = rarity_info(tree:GetAttribute("Rarity"))
 	local mult = info.ValueMultiplier or 1
@@ -423,15 +322,6 @@ local function sell_value_of(tree)
 	return weight * mult
 end
 
--- FINAL ODDS — straight from the game's own roll functions, no invented math:
---   WoodConfig.RarityChance(biome, rarity)  biome-adjusted spawn fraction
---     (verified live: BirchHills/Epic 0.06, RedwoodGrove/Epic 0.04)
---   WoodConfig.ScaleChance(scale)           size-roll fraction
---     (verified live: scale 1.0 -> 0.471, scale 2.0 -> 0.00061)
---   WoodConfig.Mutations[i].Chance          per-mutation fraction
---     (Sparkling 0.01 ... Prismatic 0.0002; MaxMutations = 1)
--- A tree with a mutation is a tree that ALSO rolled that mutation, so the
--- combined odds are the product of every roll it won. 1/N, bigger N = rarer.
 local function tree_odds(t)
 	local okC, chance = pcall(function()
 		return WoodConfig.RarityChance(t:GetAttribute("Biome"), t:GetAttribute("Rarity"))
@@ -457,8 +347,6 @@ local function tree_odds(t)
 	return 1 / chance
 end
 
--- the merchant's price for this tree exactly as the value chain reads:
--- weight x rarity multiplier x every mutation multiplier
 local function tree_price(t)
 	local info = rarity_info(t:GetAttribute("Rarity"))
 	local mult = info.ValueMultiplier or 1
@@ -476,7 +364,6 @@ local function tree_price(t)
 	return weight * mult * mutMult
 end
 
--- the game's own size tier for this tree's scale (Normal/Big/Ancient/...)
 local function tree_size_label(t)
 	local scale = tonumber(t:GetAttribute("Scale"))
 	if not scale then return "" end
@@ -492,15 +379,6 @@ local function is_live(tree)
 	return false
 end
 
--- Can this axe fell this tree AT ALL?
---
--- ChopTuning.Pressure returns BeyondReach (3) when the island's toughness exceeds
--- the axe's power. Measured with a Golden Axe (power 2.10): StarterForest 1.00,
--- BirchHills 1.70, PalmCove 2.10, SnowyPines 2.70 all chop; DustyMesa 2.80 and
--- RedwoodGrove 3.40 both return 3, which means the tree cannot be felled at all
--- with that axe — not slowly, but never. RedwoodGrove is where the rarest
--- species live, so a rarity-first picker would otherwise spend the whole run
--- hammering trees that refuse every single time.
 local function held_axe_id()
 	local char = plr.Character
 	if not char then return nil end
@@ -510,7 +388,6 @@ local function held_axe_id()
 	return nil
 end
 
--- the spec shape ChopTuning expects, built from whatever is in hand
 local function current_axe_spec()
 	local id = held_axe_id()
 	if not id then return nil end
@@ -534,12 +411,10 @@ local function can_fell(tree, axeSpec)
 			tree:GetAttribute("Size"),
 			axeSpec)
 	end)
-	if not ok then return true end -- unknown shape: do not block on a guess
+	if not ok then return true end
 	return pressure < ChopTuning.BeyondReach
 end
 
--- Ask the server's own formula how long this chop will take, rather than
--- assuming one fixed hold for every tree.
 local function chop_seconds(tree, axeSpec)
 	if not axeSpec then return nil end
 	local ok, res = pcall(function()
@@ -556,20 +431,6 @@ end
 
 local MODES = {"Nearest", "MostValuable", "SellValue", "Rarest", "Heaviest", "Biggest", "Any"}
 
--- Hop to the smallest public server in this place.
---
--- Two things made the old hop dead on arrival:
---  1. TeleportService:GetServerPlaceInstancesAsync does not exist on this
---     executor, so there is no in-engine way to enumerate servers.
---  2. This function referenced safe_set/stateLabel before their `local`
---     declarations — lexical scoping resolved them to GLOBAL nil, so the first
---     call errored inside task.spawn and the button silently did nothing.
---
--- The rewrite lists servers over the games HTTP API (verified working through
--- the executor's http_request: 51 public servers returned for this place),
--- sorts by population, and teleports to the emptiest one that is not the
--- server we are already in. Returns a status string; the caller renders it, so
--- scoping stays clean.
 local function hop_to_low_server()
 	local TS = game:GetService("TeleportService")
 	local HS = game:GetService("HttpService")
@@ -579,7 +440,6 @@ local function hop_to_low_server()
 		or (typeof(request) == "function" and request)
 		or nil
 	if not fetch then
-		-- no HTTP lane: plain rejoin and hope the matchmaker spreads us out
 		task.spawn(function()
 			pcall(function() TS:Teleport(game.PlaceId, plr) end)
 		end)
@@ -606,7 +466,6 @@ local function hop_to_low_server()
 		return "rejoin (bad json)"
 	end
 
-	-- emptiest server we are not already in
 	local best = nil
 	for _, s in ipairs(data.data) do
 		if type(s) == "table" and type(s.id) == "string" and s.id ~= game.JobId then
@@ -622,7 +481,6 @@ local function hop_to_low_server()
 		return "no other public server"
 	end
 	if best.count + 1 >= here then
-		-- joining it would not make this one any quieter than staying
 		return ("already among quietest (%d here, best %d)"):format(here, best.count)
 	end
 
@@ -631,23 +489,6 @@ local function hop_to_low_server()
 	end)
 	return ("hop: %d here -> %d/20"):format(here, best.count)
 end
-
-----------------------------------------------------------------------
--- ESP
-----------------------------------------------------------------------
--- Purely client-side overlay: Highlights + BillboardGui tags. Nothing here
--- touches a remote, so nothing replicates — other players and the server see
--- none of it. One workspace Folder holds every instance, so unload is a single
--- Destroy.
---
--- Trees are tagged with rich-text billboards, never Highlights (Roblox renders
--- at most ~31 Highlights at once and a forest has far more trees than that).
--- Each tag reads the live game data: species in the rarity's own colour, worth
--- in a money band (grey → lime → gold → pink as the price climbs), rarity,
--- mutations by name, distance, and a red X when the held axe cannot fell the
--- tree at all. Players get a Highlight plus a name+distance tag that turns red
--- inside the panic radius. Merchants get gold tags. Every visual knob lives in
--- S.esp and is read per tick, so UI changes land without restarting overlays.
 
 local ESP = {folder = nil, treeTags = {}, playerTags = {}, merchTags = {}, conns = {}, counts = {}}
 local espCfg = S.esp
@@ -674,8 +515,6 @@ local function esp_kill_highlights()
 		if d:IsA("Highlight") and d.Name == "BlzPlayerHL" then d:Destroy() end
 	end
 end
-
--- colour helpers ------------------------------------------------------------
 
 local rarColorCache = {}
 local function rarity_color(name)
@@ -714,8 +553,6 @@ local MUTED_HEX = "#9aa0a6"
 local DANGER_HEX = "#ff5a5a"
 local SHOP_HEX = "#ffcd40"
 
--- money bands: the eye reads price classes faster than exact numbers, and the
--- exact number is on the tag anyway
 local function value_band(v)
 	if v >= 100000 then return Color3.fromRGB(255, 90, 140) end
 	if v >= 10000 then return Color3.fromRGB(255, 205, 64) end
@@ -729,8 +566,6 @@ local function fmt_val(v)
 	if v >= 1e3 then return ("$%.1fk"):format(v / 1e3) end
 	return ("$%d"):format(math.floor(v))
 end
-
--- billboard factory ----------------------------------------------------------
 
 local function esp_billboard(tagName, adornee, richText)
 	local wide = 178 + espCfg.textSize * 3
@@ -757,7 +592,6 @@ local function esp_billboard(tagName, adornee, richText)
 	return bb
 end
 
--- refresh an existing tag in place (text + size + range) instead of rebuilding
 local function esp_refresh_tag(bb, richText)
 	if not bb or not bb.Parent then return end
 	pcall(function()
@@ -767,8 +601,6 @@ local function esp_refresh_tag(bb, richText)
 		t.Text = richText
 	end)
 end
-
--- tag text builders ----------------------------------------------------------
 
 local function esp_tree_text(t, dist, okFell)
 	local wood = t:GetAttribute("Wood") or t.Name
@@ -820,8 +652,6 @@ local function esp_merchant_text(dist, label)
 	end
 	return who
 end
-
--- overlays -------------------------------------------------------------------
 
 local function esp_tag_player(p)
 	local char = p.Character
@@ -950,9 +780,6 @@ local function esp_merchants_loop(myToken)
 						local dist = (pos - myRoot.Position).Magnitude
 						if dist <= espCfg.maxDist then
 							local tag = ESP.merchTags[d]
-							-- the travelling merchant is the bare "Merchant" model
-							-- (the notice calls her Miku); permanent ones are
-							-- "<Name> the Merchant", so trim to the first name
 							local label = "Merchant"
 							if d.Name == "Merchant" then
 								label = "Miku"
@@ -1017,7 +844,6 @@ local function esp_apply(kind, on)
 			ESP.counts.shops = nil
 		end
 	end
-	-- every overlay off: no reason to keep the join/leave/respawn listeners
 	if not cfg.players and not cfg.trees and not cfg.merchants then esp_kill_conns() end
 end
 
@@ -1035,9 +861,6 @@ local function esp_counts_text()
 	return table.concat(bits, "  ·  ")
 end
 
--- Panic mode: true when another player is within radius of a position. Trees
--- with someone standing next to them get dropped, so the farm never chops in
--- plain view of a player who could watch or report it.
 local function player_near(pos, radius)
 	for _, p in ipairs(game.Players:GetPlayers()) do
 		if p ~= plr then
@@ -1051,8 +874,6 @@ local function player_near(pos, radius)
 	return false
 end
 
--- nearest other player to a position, flat distance — used by the Panic
--- status readout and the farm stand-down below
 local function nearest_player_dist(pos)
 	local best, who = math.huge, nil
 	for _, p in ipairs(game.Players:GetPlayers()) do
@@ -1077,12 +898,8 @@ local function pick(mode, blocked)
 	local panicked = 0
 	for _, t in ipairs(folder:GetChildren()) do
 		if is_live(t) and not (blocked[t] and blocked[t] > now) then
-			-- Panic mode drops trees with a player standing beside them.
 			if S.panicOn and player_near(t:GetPivot().Position, S.panicRadius) then
 				panicked += 1
-			-- Drop trees this axe physically cannot fell. Without this the
-			-- rarest-first modes keep picking RedwoodGrove monsters that refuse
-			-- every attempt, which reads as "hopping trees without chopping".
 			elseif can_fell(t, axeSpec) then
 				table.insert(list, t)
 			else
@@ -1104,7 +921,6 @@ local function pick(mode, blocked)
 	if mode == "Nearest" then
 		table.sort(list, function(a, b) return dist(a) < dist(b) end)
 	elseif mode == "MostValuable" then
-		-- rarest and richest first: value, then rarity tier, then closer wins ties
 		table.sort(list, function(a, b)
 			local va, vb = value_of(a), value_of(b)
 			if va ~= vb then return va > vb end
@@ -1113,9 +929,6 @@ local function pick(mode, blocked)
 			return dist(a) < dist(b)
 		end)
 	elseif mode == "SellValue" then
-		-- What the merchant actually pays: weight x the rarity multiplier. This
-		-- differs from MostValuable, which ranks by scale and mutation count
-		-- only — a light Mythic outranks a heavy Epic there, but pays less.
 		table.sort(list, function(a, b)
 			local vaa, vab = sell_value_of(a), sell_value_of(b)
 			if vaa ~= vab then return vaa > vab end
@@ -1143,15 +956,6 @@ local function pick(mode, blocked)
 	return list[1]
 end
 
--- one tree: teleport under it, hold the server's minimum session, finish.
---
--- Every exit path releases the server-side lock. A session left open wedges the
--- loop into "hop forever, never chop" because each new StartChop is refused.
---
--- Teleporting far can arrive before the move replicates, so the first StartChop
--- is sometimes refused with "Get closer" even though the position is correct —
--- confirmed intermittent at a fixed spot. A short retry covers it; only give up
--- after the position has been re-asserted and still refused.
 local function chop_tree(tree)
 	if not tree or not tree.Parent then return false, "tree gone" end
 	ensure_axe_for_chop()
@@ -1164,49 +968,26 @@ local function chop_tree(tree)
 		attach(tree, true)
 		ensure_axe_for_chop()
 		local root = hrp()
-		-- guarded: the tree can be felled by someone else between pick and chop
 		local okPivot, base = pcall(function() return tree:GetPivot() end)
 		if root and okPivot and base then
 			S.preChop = ("a%d pivotY=%d nowY=%d d3=%.1f"):format(
 				attempt, math.floor(base.Position.Y), math.floor(root.Position.Y),
 				(root.Position - base.Position).Magnitude)
 		end
-		-- The second argument is the swing mark, WindupPower(elapsed) from the
-		-- game's own windup meter. Recorded by hand: a perfect finish only ever
-		-- lands when the mark is >= ~0.985 (7/7 perfects sat in 0.985..0.999,
-		-- while misses at 0.963 and 0.973 scored nothing). We used to send 1,
-		-- which is not the peak the server scores against.
 		session = call(TreeService, "StartChop", tree, 1)
 		if type(session) == "table" and session.Ok then break end
 		if tostring(session and session.Reason) == "Get closer to the tree" then
 			task.wait(0.1 * attempt)
 		else
-			break -- a real refusal (wrong axe, locked, not live) — move on
+			break
 		end
 	end
 	if type(session) ~= "table" or not session.Ok then
-		-- Do NOT call CancelChop here. Cancelling locks the tree on the server,
-		-- and a locked tree refuses every later attempt — which is exactly what
-		-- made the farm fell one tree and then hop forever. Just walk away.
 		return false, (type(session) == "table" and session.Reason) or "start failed"
 	end
 
-	-- Wait for the tree to actually come down instead of guessing a hold time.
-	--
-	-- Chop hardness is not uniform: IslandToughness runs 1.0 (StarterForest) to
-	-- 3.4 (RedwoodGrove), and rarity/size hardness multiply on top, so any single
-	-- hardcoded duration is wrong for most trees — too short and we leave before
-	-- the tree falls, too long and every easy tree wastes the difference. The
-	-- server reports progress itself, so poll it and stop the moment it is done.
-	--
-	-- Params.MinDuration is still honoured as a floor, because calling FinishChop
-	-- too early is rejected outright.
 	local floor = (session.Params and session.Params.MinDuration) or 1.2
 
-	-- Perfect cut: hold the windup until the triangle wave peaks. WindupPower
-	-- rises to 1.000 at WindupFillSeconds and decays after, so releasing at
-	-- MinDuration lands on the way up and scores nothing. When perfect mode is
-	-- on we push the floor out to the peak instead.
 	if S.perfectOn then
 		local okT, tuning = pcall(function()
 			return require(RS.Modules.Lumber.ChopTuning)
@@ -1219,16 +1000,9 @@ local function chop_tree(tree)
 	local t0 = os.clock()
 	local finish, last
 	while true do
-		-- S.sniping lets a Top-wood one-shot ride this same lane: without it a
-		-- snipe with the farm toggle OFF starts the chop and instantly cancels
-		-- here — which read as "teleports but never chops"
 		if (not S.farm and not S.sniping) or not alive() then
-			-- only a real stop cancels, and even then we leave the tree alone:
-			-- the server releases the lock on its own once the session times out
 			return false, "cancelled"
 		end
-		-- keep the character pinned; the client leash also pulls us in, and
-		-- letting velocity build up fights it
 		if tree.Parent then
 			local root = hrp()
 			if root then
@@ -1236,7 +1010,6 @@ local function chop_tree(tree)
 				root.AssemblyAngularVelocity = Vector3.zero
 			end
 		else
-			-- the tree is gone from the world: nothing left to finish
 			return true, "felled"
 		end
 
@@ -1248,19 +1021,13 @@ local function chop_tree(tree)
 				break
 			end
 			last = type(res) == "table" and res.Reason or "finish failed"
-			-- still too early / not ready: keep holding rather than bailing
 			if tostring(last):lower():match("fast") or tostring(last):lower():match("early") then
-				-- fall through and hold longer
 			elseif tostring(last) == "NotFelled" or tostring(last):lower():match("not") then
-				-- more chopping needed; keep going
 			else
-				-- a hard refusal: stop and let the loop retry. No CancelChop —
-				-- that is what locked trees and wedged the farm.
 				return false, tostring(last)
 			end
 		end
 
-		-- generous ceiling so a wedged tree cannot stall the whole run
 		if elapsed > 25 then
 			return false, "timed out: " .. tostring(last)
 		end
@@ -1270,9 +1037,6 @@ local function chop_tree(tree)
 	return true, (finish and finish.Felled) and "felled" or "held"
 end
 
-----------------------------------------------------------------------
--- axe data + shop
-----------------------------------------------------------------------
 local function owned_axes()
 	local out = {}
 	local char = plr.Character
@@ -1299,7 +1063,6 @@ local function equipped_axe()
 	return nil
 end
 
--- every axe worth buying, cheapest first, with the shop that sells it
 local function axe_ladder()
 	local shops = {}
 	for _, prompt in ipairs(CS:GetTagged("AxeView")) do
@@ -1342,7 +1105,6 @@ local function travel_to(pos)
 	task.wait(0.5)
 end
 
--- shop is proximity-gated (server answers "NotHere" otherwise), so we travel
 local function buy_axe(axe)
 	travel_to(axe.pos)
 	local res = call(AxeService, "BuyAxe", axe.id)
@@ -1353,17 +1115,9 @@ local function buy_axe(axe)
 	return false, (type(res) == "table" and res.Reason) or "buy failed"
 end
 
--- The ladder is built once at load: shop positions come from AxeView-tagged
--- prompts and prices from AxePrice. The UI statuses below read it on their
--- refresh timers, so it has to exist before the UI block.
 local ladder = axe_ladder()
 local axeRows = {}
 
--- Teleport without anchoring. An anchored root does not replicate its CFrame,
--- so the server keeps the old position and every proximity check fails against
--- it. Set the CFrame on a free root and zero the velocity instead. Defined
--- before the UI block: the Top-wood snipe buttons below capture it in their
--- callbacks, and a local declared later reads as a nil global inside them.
 local function teleport_to(pos, offset)
 	local root = hrp()
 	if not root or not pos then return false end
@@ -1374,39 +1128,24 @@ local function teleport_to(pos, offset)
 	return true
 end
 
-----------------------------------------------------------------------
--- ui
-----------------------------------------------------------------------
 local Window = Airflow:CreateWindow({
 	Name = "Blizzard",
 	LoadingSubtitle = "Foresters",
 	Icon = "trees",
 	ToggleUIKeybind = "RightShift",
-	-- AdaptiveSize shrinks the whole window on this small screen, which read as
-	-- a squashed thumbnail. Fixed size + a UI scale bump instead: 585x290 at
-	-- UIScale 1.2 renders about 702x348 — comfortably inside the 758x358
-	-- usable area, with visibly larger text than the compact default.
 	AdaptiveSize = false,
 	UIScale = 1.2,
 	Density = "Default",
 	Size = UDim2.fromOffset(585, 290),
 	ConfigurationSaving = {Enabled = true, FolderName = "ForestersHub"},
 })
--- remember it so the next run unloads exactly this window and nothing else
 S.window = Window
-
--- No clamp_window here any more. The old hack fought the original Airflow's
--- centring with a reposition loop; the fork scales itself to the screen
--- (AdaptiveSize) and keeps its own margins, so the fight is gone.
 
 local farmTab = Window:CreateTab({Name = "Farm", Icon = "tree-pine"})
 local axeTab = Window:CreateTab({Name = "Axes", Icon = "axe"})
 local legitTab = Window:CreateTab({Name = "Legit", Icon = "shield"})
 local espTab = Window:CreateTab({Name = "ESP", Icon = "eye"})
 
--- Two columns are native in the fork: groupboxes dock Left/Right, which is
--- what the old compact_tab surgery was imitating by hand. Top wood is created
--- first so it renders above Farming on the same column.
 local gbTop = farmTab:CreateGroupbox({Name = "Top wood", Side = "Left"})
 local gbFarm = farmTab:CreateGroupbox({Name = "Farming", Side = "Left"})
 local gbQuest = farmTab:CreateGroupbox({Name = "Quests", Side = "Left"})
@@ -1422,7 +1161,6 @@ local gbPerfect = legitTab:CreateGroupbox({Name = "Perfect", Side = "Left"})
 local gbEsp = espTab:CreateGroupbox({Name = "Overlay", Side = "Left"})
 local gbEspStyle = espTab:CreateGroupbox({Name = "Style", Side = "Right"})
 
--- loop counters must exist before the UI closures below read them
 local stats = {felled = 0, failed = 0, startedAt = 0, blocked = {}}
 local modeIndex = 1
 local farmOn = false
@@ -1431,12 +1169,6 @@ local function safe_set(label, text)
 	pcall(function() label:Set(text) end)
 end
 
--- Top wood: the six highest-value live trees on the whole map, re-ranked
--- every couple of seconds. Press a row: teleport to that tree and fell it
--- exactly once through the same chop lane the farm uses, then stop — a
--- targeted strike, not a farm run. The refresh loop at the bottom of the
--- script rewrites the row texts and rebinds row.tree; the callbacks read the
--- row table at click time, so a row always acts on the CURRENT tree.
 S.sniping = false
 getgenv().__TopErr = nil
 local okTop, errTop = pcall(function()
@@ -1474,19 +1206,16 @@ local okTop, errTop = pcall(function()
 			end,
 		})
 	end
-	getgenv().__TopRows = nil -- v1 key: retired so stale pre-token loops skip writing
+	getgenv().__TopRows = nil
 	getgenv().__TopRowsV2 = topRows
 	getgenv().__TopLabel = topLabel
 end)
 if not okTop then getgenv().__TopErr = tostring(errTop) end
 
--- Labels carry bare values, not "state: idle" prose. The Captain wants the
--- number, not a sentence around it.
 local stateLabel = gbFarm:CreateStatus({Name = "State", Style = "Dot", Value = "idle"})
 local targetLabel = gbFarm:CreateLabel("-")
 local countLabel = gbFarm:CreateStatus({Name = "Chopped", Style = "Row", Value = "0 / 0"})
 local rateLabel = gbFarm:CreateStatus({Name = "Rate", Style = "Row", Value = "0/min"})
--- live nearest-player readout for the panic radius: what the farm sees
 local panicLabel = gbFarm:CreateStatus({
 	Name = "Nearest",
 	Style = "Dot",
@@ -1511,8 +1240,6 @@ local questLabel = gbQuest:CreateLabel("-")
 
 local buyLabel = gbAxes:CreateStatus({Name = "Auto buy", Style = "Row", Value = "off"})
 local buyLogLabel = gbAxes:CreateLabel("-")
--- live shop snapshot, refreshed by the fork's status timers (all reads are
--- client-side: character scan, leaderstats, the prebuilt ladder table)
 gbAxes:CreateStatus({
 	Name = "Equipped",
 	Style = "Row",
@@ -1581,7 +1308,6 @@ gbPerfect:CreateToggle({
 	end,
 })
 
--- client-side only: Highlights + billboards, nothing replicates
 gbEsp:CreateToggle({
 	Name = "Players",
 	Flag = "EspPlayers",
@@ -1612,7 +1338,6 @@ gbEsp:CreateStatus({
 	Update = esp_counts_text,
 })
 
--- style knobs are read by the loops every tick, so nothing needs restarting
 gbEspStyle:CreateSlider({
 	Name = "Max distance",
 	Range = {100, 1500},
@@ -1717,9 +1442,6 @@ local function set_farm(on)
 	stats.failed = 0
 	stats.startedAt = os.clock()
 	stats.blocked = {}
-	-- No-clip is OFF on purpose and must stay off: the server rejects StartChop
-	-- from a non-collidable character, which is what produced an endless stream
-	-- of "Get closer to the tree" refusals. Keep a normal, solid character.
 	noclipOn = false
 	restore_collide()
 	refresh_state()
@@ -1727,12 +1449,6 @@ local function set_farm(on)
 	task.spawn(function()
 		while S.farm and alive() do
 			local ok, msg = pcall(function()
-				-- Panic stand-down: any player near ME stops everything.
-				-- Freezing beats fleeing — teleporting while observed is the
-				-- loudest signature this script has, and chop animations in
-				-- someone's face are worse. Resume only after the coast has
-				-- been clear for a few seconds so a player pacing the radius
-				-- edge doesn't make the farm flap on/off.
 				if S.panicOn then
 					local myRoot = hrp()
 					if myRoot then
@@ -1750,9 +1466,6 @@ local function set_farm(on)
 						end
 					end
 				end
-				-- a sell pass owns the character right now (merchant teleport
-				-- plus SellTrees proximity check); chopping would yank the root
-				-- away mid-call and every sell would land "TooFar"
 				if S.selling then
 					task.wait(0.25)
 					return "selling in progress"
@@ -1762,21 +1475,18 @@ local function set_farm(on)
 				if not root then
 					return "no character"
 				end
-				-- if we somehow ended up under the map, pull back up immediately
 				if root.Position.Y < -100 then
 					root.CFrame = CFrame.new(root.Position.X, 60, root.Position.Z)
 				end
 				local tree = pick(mode, stats.blocked)
 				if not tree then
 					set_target_text("-")
-					task.wait(0.5) -- nothing to do; do not spin the loop red hot
+					task.wait(0.5)
 					return "no tree ready"
 				end
 				set_target_text(tostring(tree:GetAttribute("Species") or tree.Name))
 				local good, result = chop_tree(tree)
 				if not good then
-					-- short bench: the position fix removed the mass-failure mode, so a
-					-- refusal here usually just means the tree went busy under us
 					stats.blocked[tree] = os.clock() + 2.5
 					stats.failed += 1
 					local root = hrp()
@@ -1792,15 +1502,6 @@ local function set_farm(on)
 				stats.felled += 1
 				S.lastFail = nil
 				refresh_axe_info()
-				-- Logs enter the inventory on their own when a tree is felled.
-				-- Quote read Count=0 Worth=0 before any chop and Count=1
-				-- Worth=47 right after one, so no pickup call is needed here.
-				--
-				-- Sell threshold counts HELD LOGS, not felled trees: one tree
-				-- yields several logs, so a tree counter sold at "50" only
-				-- once the inventory was well past 80. Quote.Count is the
-				-- server's held-log count and is readable from anywhere; the
-				-- old tree counter stays as fallback when Quote misbehaves.
 				if S.autoSell and not S.selling then
 					local held
 					local okQ, q = pcall(function() return call(LumberMillService, "Quote") end)
@@ -1813,11 +1514,6 @@ local function set_farm(on)
 					end
 					safe_set(sellLabel, ("%d / %d"):format(held, S.sellAt or 50))
 					if held >= (S.sellAt or 50) then
-						-- one sell pass at a time, and the farm loop stands down
-						-- while it runs (see the S.selling check above): without
-						-- that, every felled tree spawned another pass because
-						-- Quote never dropped, and the passes fought the farm's
-						-- teleports — label pinned on "selling…" forever
 						S.selling = true
 						safe_set(sellLabel, "selling…")
 						task.spawn(function()
@@ -1867,23 +1563,6 @@ gbFarm:CreateDropdown({
 	end,
 })
 
--- Perfect cut cannot be scripted, so there is deliberately no toggle for it.
---
--- Recorded by hand across two practice sessions: the swing mark
--- (WindupPower, the second argument to StartChop) does not decide the score.
--- A mark of 0.9994 scored a miss while 0.9634 scored a perfect, and a clean
--- 7/7 run sat in 0.985..0.999 purely because the player was hitting the
--- minigame spot, not because of any particular mark. The bar is
--- BarWidth=0.4254 with SpotSpeed=0.203 and SpotJitter=0.805 — you have to
--- catch the spot.
---
--- Forcing a mark from here makes it worse, not better: sending a fixed 0.995
--- produced failed=917 with felled=0, because the server validates the mark
--- against the real minigame result. So the second FinishChop argument stays
--- false and perfect chops stay a player skill.
--- The Auto Perfect toggle now plays the real minigame path instead; see
--- README_LEGIT.md.
-
 gbFarm:CreateToggle({
 	Name = "Panic Mode",
 	Flag = "PanicMode",
@@ -1905,12 +1584,6 @@ gbFarm:CreateSlider({
 	end,
 })
 
--- Auto sell.
---
--- SellTrees lives on LumberMillService and takes "All" or "Held". Selling is
--- proximity checked — the merchant has to be within reach — so the farm
--- teleports to the nearest merchant before selling rather than calling it from
--- wherever it happens to be standing.
 local function sell_logs()
 	local res = call(LumberMillService, "SellTrees", "All")
 	if type(res) == "table" and res.Ok then return true end
@@ -1946,9 +1619,6 @@ local function auto_sell_pass()
 		if ok and pos then
 			local root = hrp()
 			if root then
-				-- Teleport even when already "close": the server measures
-				-- reach from the position IT has, and a stale one answers
-				-- TooFar even from 5 studs away on the client.
 				root.Anchored = false
 				root.CFrame = CFrame.new(pos + Vector3.new(0, 3, 5))
 				root.AssemblyLinearVelocity = Vector3.zero
@@ -1957,7 +1627,6 @@ local function auto_sell_pass()
 			end
 		end
 	end
-	-- retry: the first attempt often lands before the move replicates
 	local lastWhy
 	for attempt = 1, 4 do
 		local ok, why = sell_logs()
@@ -2006,24 +1675,12 @@ gbServer:CreateButton({
 	Callback = function()
 		task.spawn(function()
 			local msg = hop_to_low_server()
-			-- the teleport, when it happens, disconnects us within a second —
-			-- still show where we were headed so a fail is readable
 			safe_set(hopLabel, msg)
 		end)
 	end,
 })
 gbServer:CreateLabel("server listed via games API")
 
-----------------------------------------------------------------------
--- quests
-----------------------------------------------------------------------
--- Quests are handed in per line, at the NPC that owns the line. There is no
--- bulk-claim remote: QuestService exposes Accept/HandIn/Meet/Track, and HandIn
--- takes a line id. It answers Ok=false Reason="NotReady" while objectives are
--- unfinished, which is the normal case, not an error.
---
--- HandIn is proximity checked ("Come a little closer"), so a line whose NPC is
--- far away will refuse. We report per line rather than pretending it worked.
 local function claim_all_quests()
 	local RS = game:GetService("ReplicatedStorage")
 	local Knit = require(RS.Packages.Knit)
@@ -2034,14 +1691,11 @@ local function claim_all_quests()
 	local notes = {}
 
 	for _, line in ipairs(QC.Lines) do
-		-- Meet opens the line where the game requires an introduction first
 		pcall(function() QS:Meet(line.Id) end)
-		-- Accept any quest the line is offering right now
 		local acc = call(QS, "Accept", line.Id)
 		if type(acc) == "table" and acc.Ok then
 			table.insert(notes, "accept " .. tostring(line.Id))
 		end
-		-- Hand in whatever is finished
 		local res = call(QS, "HandIn", line.Id)
 		if type(res) == "table" then
 			if res.Ok then
@@ -2068,13 +1722,8 @@ gbQuest:CreateButton({
 	end,
 })
 
-----------------------------------------------------------------------
--- axe ladder ui
-----------------------------------------------------------------------
 local autobuyOn = false
 
--- owned axes get disabled so the ladder reads as a progress bar: greyed rows
--- behind you, live rows ahead
 local function refresh_ladder()
 	local own = owned_axes()
 	local eq = equipped_axe()
@@ -2102,7 +1751,6 @@ for _, axe in ipairs(ladder) do
 	table.insert(axeRows, {axe = axe, button = button})
 end
 
--- cheapest axe we do not own yet, that we can afford
 local function next_target()
 	local own = owned_axes()
 	for _, axe in ipairs(ladder) do
@@ -2160,23 +1808,7 @@ gbAxes:CreateButton({
 	end,
 })
 
-----------------------------------------------------------------------
--- Miku teleport
-----------------------------------------------------------------------
--- Miku is the travelling merchant. Verified live: her rig is parked as a
--- Model literally named "Merchant" directly under workspace.Map.NPCs while
--- her visit lasts (Humanoid + R6 parts + TalkPrompt), and the join notice
--- calls her Miku — the model itself never carries that name. The permanent
--- island merchants are named "<Name> the Merchant", so the exact child name
--- "Merchant" is unambiguous. A player named Miku is also accepted, and the
--- old workspace-wide name scan stays as a last resort.
-----------------------------------------------------------------------
 local function find_miku()
-	-- the join notice calls her Miku, but the rig is named "Merchant".
-	-- Verified live: one Model named "Merchant" sits directly under
-	-- workspace.Map.NPCs while her visit lasts (R6 + HumanoidRootPart +
-	-- TalkPrompt); permanent shops are "<Name> the Merchant", so the exact
-	-- name is unambiguous.
 	local npcs = workspace:FindFirstChild("Map") and workspace.Map:FindFirstChild("NPCs")
 	if npcs then
 		local m = npcs:FindFirstChild("Merchant")
@@ -2187,7 +1819,6 @@ local function find_miku()
 			if ok and pos then return pos, "Miku (travelling merchant)" end
 		end
 	end
-	-- a player named Miku wins too: they move, so teleport to their live position
 	for _, p in ipairs(game.Players:GetPlayers()) do
 		if p ~= plr
 			and (string.lower(p.Name):match("miku") or string.lower(p.DisplayName):match("miku")) then
@@ -2195,7 +1826,6 @@ local function find_miku()
 			if root then return root.Position, "player " .. p.Name end
 		end
 	end
-	-- otherwise look for a spawned NPC
 	for _, d in ipairs(workspace:GetDescendants()) do
 		if string.lower(d.Name):match("miku") then
 			local pos
@@ -2206,9 +1836,6 @@ local function find_miku()
 	end
 	return nil, nil
 end
-
--- teleport_to is hoisted above the UI block so the snipe-button callbacks
--- capture the local, not a nil global.
 
 gbUtil:CreateButton({
 	Name = "TP to Miku",
@@ -2230,9 +1857,6 @@ gbAxes:CreateParagraph({
 	Content = "The server rejects purchases unless you are standing at the shop, so auto buy travels to the axe's island stall first.",
 })
 
-----------------------------------------------------------------------
--- keep noclip alive while farming (the Humanoid re-solidifies parts)
-----------------------------------------------------------------------
 RunService.RenderStepped:Connect(function()
 	if noclipOn and S.farm and alive() then
 		noclip_pass()
@@ -2247,7 +1871,6 @@ plr.CharacterAdded:Connect(function()
 	end
 end)
 
--- periodic refresh so prices/bucks stay honest
 task.spawn(function()
 	while alive() do
 		task.wait(2)
@@ -2266,8 +1889,6 @@ getgenv().ForestFarm = {
 	end,
 	stop = function()
 		set_farm(false)
-		-- release the character: an anchored root never teleports again, which
-		-- silently kills the next run's ability to reach any tree
 		task.spawn(function()
 			local char = plr.Character
 			local root = char and char:FindFirstChild("HumanoidRootPart")
@@ -2305,14 +1926,6 @@ refresh_state()
 refresh_axe_info()
 refresh_ladder()
 
--- Top wood live ranking: re-scan, re-rank, rewrite the six rows every 2s.
--- Value-ranked across the WHOLE map (distance is shown, not filtered) — the
--- point of the list is finding the best tree anywhere, then sniping it.
--- Top wood live ranking: re-scan, re-rank, rewrite the six rows every 2s.
--- Row text is deliberately dense: species, rarity, the merchant's price
--- (weight x rarity multiplier), mutation names, live state and distance —
--- everything needed to decide "is this row worth a teleport" without opening
--- anything else.
 local function top_wood_row_text(t, dist)
 	local wood = t:GetAttribute("Wood") or t.Name
 	local odds = math.floor(tree_odds(t) + 0.5)
@@ -2329,7 +1942,6 @@ local function top_wood_row_text(t, dist)
 	end
 	local state = tostring(t:GetAttribute("State") or "?")
 	local d = dist and ("  %dm"):format(dist) or ""
-	-- Normal-size trees skip the size token — only a rolled-up tier is news
 	if size ~= "" and size ~= "Normal" then
 		return ("%s  ·  1/%s  ·  %s  ·  %s%s  ·  %s%s"):format(
 			wood, odds, size, fmt_val(tree_price(t)), mutTxt, state, d)
@@ -2339,8 +1951,6 @@ local function top_wood_row_text(t, dist)
 end
 
 task.spawn(function()
-	-- token guard: a re-exec bumps S.token, which retires THIS loop — without
-	-- it two builds' ranking loops both rewrote the same rows every 2s
 	local myToken = S.token
 	while alive() and S.token == myToken do
 		local rows = getgenv().__TopRowsV2
@@ -2353,8 +1963,6 @@ task.spawn(function()
 					list[#list+1] = t
 				end
 			end
-			-- final-rarity ranking: combined odds (rarity x size x mutations)
-			-- first, the tree's real price breaks ties between equals
 			table.sort(list, function(a, b)
 				local oa, ob = tree_odds(a), tree_odds(b)
 				if oa ~= ob then return oa > ob end
