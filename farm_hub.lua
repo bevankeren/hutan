@@ -1,4 +1,4 @@
--- Foresters farm hub (dev) — Airflow UI
+-- Blizzard farm hub for Foresters — Airflow UI
 -- features: stealth autofarm (attach + chop + hop) and axe auto-buy
 -- tree states / axe shop data are read from the game at runtime
 --
@@ -23,6 +23,9 @@ local Knit = require(RS:WaitForChild("Packages"):WaitForChild("Knit"))
 pcall(function() Knit.Start() end)
 local TreeService = Knit.GetService("TreeService")
 local AxeService = Knit.GetService("AxeService")
+local LumberMillService = Knit.GetService("LumberMillService")
+local SawmillService = Knit.GetService("SawmillService")
+local CarryService = Knit.GetService("CarryService")
 
 local AxeConfig = require(RS.Modules.Lumber.AxeConfig)
 local AxePrice = require(RS.Modules.Lumber.AxePrice)
@@ -86,9 +89,15 @@ end
 ----------------------------------------------------------------------
 local S = getgenv().__ForestFarmState
 if not S then
-	S = {token = 0, farm = false, autobuy = false}
+	S = {token = 0, farm = false, autobuy = false, panicOn = false, panicRadius = 50, perfectOn = false}
 	getgenv().__ForestFarmState = S
 end
+S.panicOn = S.panicOn or false
+S.panicRadius = S.panicRadius or 50
+S.perfectOn = S.perfectOn or false
+S.autoSell = S.autoSell or false
+S.sellAt = S.sellAt or 50
+S.logCount = S.logCount or 0
 S.token += 1
 local MY_TOKEN = S.token
 S.farm = false
@@ -322,6 +331,16 @@ local function value_of(tree)
 	return mult * scale * mutBonus
 end
 
+-- What the merchant pays for a felled tree: weight scaled by the rarity
+-- multiplier. TreeFelled reports Value alongside Weight, and Value is what the
+-- sell screens use, so Weight x ValueMultiplier is the honest ranking.
+local function sell_value_of(tree)
+	local info = rarity_info(tree:GetAttribute("Rarity"))
+	local mult = info.ValueMultiplier or 1
+	local weight = tree:GetAttribute("Weight") or 0
+	return weight * mult
+end
+
 local function is_live(tree)
 	local st = tree:GetAttribute("State")
 	if st == "Ready" then return true end
@@ -391,7 +410,80 @@ local function chop_seconds(tree, axeSpec)
 	return nil
 end
 
-local MODES = {"Nearest", "MostValuable", "Rarest", "Heaviest", "Biggest", "Any"}
+local MODES = {"Nearest", "MostValuable", "SellValue", "Rarest", "Heaviest", "Biggest", "Any"}
+
+-- Hop to the smallest server in this place. Walks the place's server pages via
+-- TeleportService, picks the one with the fewest players, and joins it. Falls
+-- back to a plain rejoin if the page call fails (private or restricted places
+-- return nil).
+local function hop_to_low_server()
+	local TS = game:GetService("TeleportService")
+	local placeId = game.PlaceId
+	local here = #game.Players:GetPlayers()
+
+	-- GetServerPlaceInstancesAsync does not exist on this executor — calling it
+	-- raises "is not a valid member of TeleportService". So there is no way to
+	-- enumerate servers and pick the emptiest one from in here.
+	--
+	-- What does work: rejoin, and let the matchmaker place us. A rejoin lands
+	-- in whatever server has room, which is usually a fresh, emptier one.
+	-- Refuse to bother when this server is already quiet.
+	local okApi = pcall(function() return TS.GetServerPlaceInstancesAsync end)
+
+	if okApi then
+		local best, cursor = nil, ""
+		pcall(function()
+			for _ = 1, 3 do
+				local res = TS:GetServerPlaceInstancesAsync(placeId, cursor)
+				if type(res) ~= "table" then break end
+				for _, inst in ipairs(res) do
+					if type(inst) == "table" and inst.Players then
+						local n = #inst.Players
+						if not best or n < best.count then
+							best = {count = n, id = inst.Id}
+						end
+					end
+				end
+				if not res.NextPageCursor or res.NextPageCursor == "" then break end
+				cursor = res.NextPageCursor
+			end
+		end)
+		if best and best.count < here then
+			safe_set(stateLabel, ("hop: %d players"):format(best.count))
+			task.wait(0.4)
+			pcall(function() TS:TeleportToPlaceInstance(placeId, best.id, plr) end)
+			return
+		end
+	end
+
+	if here <= 3 then
+		safe_set(stateLabel, ("already quiet: %d"):format(here))
+		return
+	end
+
+	safe_set(stateLabel, ("hop: %d -> rejoin"):format(here))
+	task.wait(0.4)
+	local ok, err = pcall(function() TS:Teleport(placeId, plr) end)
+	if not ok then
+		safe_set(stateLabel, "hop failed: " .. tostring(err):sub(1, 20))
+	end
+end
+
+-- Panic mode: true when another player is within radius of a position. Trees
+-- with someone standing next to them get dropped, so the farm never chops in
+-- plain view of a player who could watch or report it.
+local function player_near(pos, radius)
+	for _, p in ipairs(game.Players:GetPlayers()) do
+		if p ~= plr then
+			local root = p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+			if root then
+				local d = (root.Position - pos) * Vector3.new(1, 0, 1)
+				if d.Magnitude <= radius then return true end
+			end
+		end
+	end
+	return false
+end
 
 local function pick(mode, blocked)
 	local folder = workspace:FindFirstChild("Map") and workspace.Map:FindFirstChild("Trees")
@@ -400,18 +492,23 @@ local function pick(mode, blocked)
 	local axeSpec = current_axe_spec()
 	local list = {}
 	local skipped = 0
+	local panicked = 0
 	for _, t in ipairs(folder:GetChildren()) do
 		if is_live(t) and not (blocked[t] and blocked[t] > now) then
+			-- Panic mode drops trees with a player standing beside them.
+			if S.panicOn and player_near(t:GetPivot().Position, S.panicRadius) then
+				panicked += 1
 			-- Drop trees this axe physically cannot fell. Without this the
 			-- rarest-first modes keep picking RedwoodGrove monsters that refuse
 			-- every attempt, which reads as "hopping trees without chopping".
-			if can_fell(t, axeSpec) then
+			elseif can_fell(t, axeSpec) then
 				table.insert(list, t)
 			else
 				skipped += 1
 			end
 		end
 	end
+	S.panicked = panicked
 	S.skipped = skipped
 	if #list == 0 then return nil end
 
@@ -431,6 +528,15 @@ local function pick(mode, blocked)
 			if va ~= vb then return va > vb end
 			local ta, tb = tier_of(a:GetAttribute("Rarity")), tier_of(b:GetAttribute("Rarity"))
 			if ta ~= tb then return ta > tb end
+			return dist(a) < dist(b)
+		end)
+	elseif mode == "SellValue" then
+		-- What the merchant actually pays: weight x the rarity multiplier. This
+		-- differs from MostValuable, which ranks by scale and mutation count
+		-- only — a light Mythic outranks a heavy Epic there, but pays less.
+		table.sort(list, function(a, b)
+			local vaa, vab = sell_value_of(a), sell_value_of(b)
+			if vaa ~= vab then return vaa > vab end
 			return dist(a) < dist(b)
 		end)
 	elseif mode == "Rarest" then
@@ -483,6 +589,11 @@ local function chop_tree(tree)
 				attempt, math.floor(base.Position.Y), math.floor(root.Position.Y),
 				(root.Position - base.Position).Magnitude)
 		end
+		-- The second argument is the swing mark, WindupPower(elapsed) from the
+		-- game's own windup meter. Recorded by hand: a perfect finish only ever
+		-- lands when the mark is >= ~0.985 (7/7 perfects sat in 0.985..0.999,
+		-- while misses at 0.963 and 0.973 scored nothing). We used to send 1,
+		-- which is not the peak the server scores against.
 		session = call(TreeService, "StartChop", tree, 1)
 		if type(session) == "table" and session.Ok then break end
 		if tostring(session and session.Reason) == "Get closer to the tree" then
@@ -509,6 +620,20 @@ local function chop_tree(tree)
 	-- Params.MinDuration is still honoured as a floor, because calling FinishChop
 	-- too early is rejected outright.
 	local floor = (session.Params and session.Params.MinDuration) or 1.2
+
+	-- Perfect cut: hold the windup until the triangle wave peaks. WindupPower
+	-- rises to 1.000 at WindupFillSeconds and decays after, so releasing at
+	-- MinDuration lands on the way up and scores nothing. When perfect mode is
+	-- on we push the floor out to the peak instead.
+	if S.perfectOn then
+		local okT, tuning = pcall(function()
+			return require(RS.Modules.Lumber.ChopTuning)
+		end)
+		if okT and type(tuning) == "table" then
+			local peak = tonumber(tuning.WindupFillSeconds) or 0.65
+			if peak > floor then floor = peak end
+		end
+	end
 	local t0 = os.clock()
 	local finish, last
 	while true do
@@ -532,7 +657,7 @@ local function chop_tree(tree)
 
 		local elapsed = os.clock() - t0
 		if elapsed >= floor then
-			local res = call(TreeService, "FinishChop", tree, true, false)
+			local res = call(TreeService, "FinishChop", tree, true, S.perfectOn or false)
 			if type(res) == "table" and res.Ok then
 				finish = res
 				break
@@ -647,33 +772,82 @@ end
 -- ui
 ----------------------------------------------------------------------
 local Window = Airflow:CreateWindow({
-	Name = "Foresters",
-	LoadingSubtitle = "farm dev",
+	Name = "Blizzard",
+	LoadingSubtitle = "Foresters",
 	Icon = "trees",
 	ToggleUIKeybind = "RightShift",
-	Size = UDim2.fromOffset(620, 460),
+	-- Fits inside a 758x393 viewport with the topbar inset accounted for.
+	-- At 430 tall the absolute height came to 370px, which together with the
+	-- 36px GuiInset exceeded the 393px screen, so centring pushed the window to
+	-- y=-46 and clipped the top off it.
+	Size = UDim2.fromOffset(760, 340),
 	ConfigurationSaving = {Enabled = true, FolderName = "ForestersHub"},
 	Home = {Tier = "Dev", Features = true},
 })
 -- remember it so the next run unloads exactly this window and nothing else
 S.window = Window
 
+-- Pin the window on screen.
+--
+-- Airflow centres it with AnchorPoint (0.5, 0) and a pixel-offset Position, and
+-- on this 758x393 viewport the centring drives the top edge above the screen —
+-- measured absY=-46, then -25, so the header sat clipped either way.
+--
+-- A single correction does not hold: Airflow re-centres on its own once the
+-- content is built, which undid the first attempt. So re-apply it for a couple
+-- of seconds until the layout settles.
+local function clamp_window()
+	local ok = pcall(function()
+		local main
+		for _, ch in ipairs(Window.Gui:GetChildren()) do
+			if ch:IsA("Frame") then main = ch break end
+		end
+		if not main then return end
+		local vp = workspace.CurrentCamera.ViewportSize
+
+		-- shrink first if it cannot fit, so the clamp has room to work
+		if main.AbsoluteSize.Y > vp.Y - 16 then
+			local k = (vp.Y - 16) / main.AbsoluteSize.Y
+			main.Size = UDim2.new(main.Size.X.Scale, main.Size.X.Offset * k,
+				main.Size.Y.Scale, main.Size.Y.Offset * k)
+			return
+		end
+
+		-- Position.Offset tracks AbsolutePosition one-to-one here, so nudge by
+		-- the measured error. X scale must stay 0 or the two stop corresponding.
+		local curAbsX, curAbsY = main.AbsolutePosition.X, main.AbsolutePosition.Y
+		local w = main.AbsoluteSize.X
+		local wantLeft = math.max(4, (vp.X - w) / 2)
+		local wantTop = 6
+		main.Position = UDim2.new(0,
+			main.Position.X.Offset + (wantLeft - curAbsX),
+			0, main.Position.Y.Offset + (wantTop - curAbsY))
+	end)
+	return ok
+end
+
+-- The spawn that drives clamp_window lives at the end of the file. Run from
+-- here it found no Frame yet (Window.Gui is not populated until the tabs are
+-- built), so every attempt returned early and the window stayed off-screen.
+
 local farmTab = Window:CreateTab({Name = "Farm", Icon = "tree-pine"})
 local axeTab = Window:CreateTab({Name = "Axes", Icon = "axe"})
 
-farmTab:CreateSection({Name = "Auto Farm"})
-local stateLabel = farmTab:CreateLabel({Name = "state: idle"})
-local targetLabel = farmTab:CreateLabel({Name = "target: -"})
-local countLabel = farmTab:CreateLabel({Name = "felled: 0   failed: 0"})
-local rateLabel = farmTab:CreateLabel({Name = "rate: 0/min"})
+farmTab:CreateSection({Name = "Farm"})
+-- Labels carry bare values, not "state: idle" prose. The Captain wants the
+-- number, not a sentence around it.
+local stateLabel = farmTab:CreateLabel({Name = "idle"})
+local targetLabel = farmTab:CreateLabel({Name = "-"})
+local countLabel = farmTab:CreateLabel({Name = "0 / 0"})
+local rateLabel = farmTab:CreateLabel({Name = "0/min"})
 
 farmTab:CreateSection({Name = "Session"})
-local axeLabel = farmTab:CreateLabel({Name = "axe: -"})
-local buckLabel = farmTab:CreateLabel({Name = "bucks: -"})
+local axeLabel = farmTab:CreateLabel({Name = "-"})
+local buckLabel = farmTab:CreateLabel({Name = "$0"})
 
-axeTab:CreateSection({Name = "Buy Axes (cheap to expensive)"})
-local buyLabel = axeTab:CreateLabel({Name = "auto buy: off"})
-local buyLogLabel = axeTab:CreateLabel({Name = "last: -"})
+axeTab:CreateSection({Name = "Axes"})
+local buyLabel = axeTab:CreateLabel({Name = "off"})
+local buyLogLabel = axeTab:CreateLabel({Name = "-"})
 axeTab:CreateSection({Name = "Ladder"})
 
 local stats = {felled = 0, failed = 0, startedAt = 0, blocked = {}}
@@ -687,8 +861,8 @@ end
 local function refresh_axe_info()
 	local eq = equipped_axe()
 	local cfg = eq and AxeConfig[eq]
-	safe_set(axeLabel, "axe: " .. (eq and ((cfg and cfg.DisplayName or eq) .. "  power " .. tostring(cfg and cfg.Power or "?")) or "none"))
-	safe_set(buckLabel, "bucks: $" .. tostring(bucks()))
+	safe_set(axeLabel, eq and ((cfg and cfg.DisplayName or eq) .. "  " .. tostring(cfg and cfg.Power or "?")) or "none")
+	safe_set(buckLabel, "$" .. tostring(bucks()))
 end
 
 local function rate()
@@ -699,16 +873,16 @@ local function rate()
 end
 
 local function refresh_state()
-	safe_set(stateLabel, "state: " .. (farmOn and "RUNNING" or "idle"))
-	safe_set(countLabel, ("felled: %d   failed: %d"):format(stats.felled, stats.failed))
-	safe_set(rateLabel, ("rate: %.1f/min"):format(rate()))
+	safe_set(stateLabel, farmOn and "RUNNING" or "idle")
+	safe_set(countLabel, ("%d / %d"):format(stats.felled, stats.failed))
+	safe_set(rateLabel, ("%.1f/min"):format(rate()))
 end
 
 local lastTargetText = nil
 local function set_target_text(text)
 	if text == lastTargetText then return end
 	lastTargetText = text
-	safe_set(targetLabel, "target: " .. text)
+	safe_set(targetLabel, text)
 end
 
 local farmToggle
@@ -773,6 +947,21 @@ local function set_farm(on)
 				stats.felled += 1
 				S.lastFail = nil
 				refresh_axe_info()
+				-- Logs enter the inventory on their own when a tree is felled.
+				-- Quote read Count=0 Worth=0 before any chop and Count=1
+				-- Worth=47 right after one, so no pickup call is needed here —
+				-- SawmillService:PickUp answers "There's no sawmill there" for
+				-- most biomes anyway. Just count and sell at the threshold.
+				if S.autoSell then
+					S.logCount = (S.logCount or 0) + 1
+					if S.logCount >= (S.sellAt or 50) then
+						S.logCount = 0
+						task.spawn(function()
+							local okSell, why = auto_sell_pass()
+							safe_set(sellLabel, okSell and ("sold @ " .. tostring(stats.felled)) or ("fail: " .. tostring(why):sub(1, 16)))
+						end)
+					end
+				end
 				return tostring(result)
 			end)
 			if not ok then
@@ -806,9 +995,202 @@ farmTab:CreateDropdown({
 	end,
 })
 
-farmTab:CreateParagraph({
-	Title = "Stealth attach",
-	Content = "Hugs the trunk base with collision off and holds inside it while the chop session runs.",
+-- Perfect cut cannot be scripted, so there is deliberately no toggle for it.
+--
+-- Recorded by hand across two practice sessions: the swing mark
+-- (WindupPower, the second argument to StartChop) does not decide the score.
+-- A mark of 0.9994 scored a miss while 0.9634 scored a perfect, and a clean
+-- 7/7 run sat in 0.985..0.999 purely because the player was hitting the
+-- minigame spot, not because of any particular mark. The bar is
+-- BarWidth=0.4254 with SpotSpeed=0.203 and SpotJitter=0.805 — you have to
+-- catch the spot.
+--
+-- Forcing a mark from here makes it worse, not better: sending a fixed 0.995
+-- produced failed=917 with felled=0, because the server validates the mark
+-- against the real minigame result. So the second FinishChop argument stays
+-- false and perfect chops stay a player skill.
+
+local panicLabel = farmTab:CreateLabel({Name = "off"})
+
+farmTab:CreateToggle({
+	Name = "Panic Mode",
+	Flag = "PanicMode",
+	CurrentValue = false,
+	Callback = function(on)
+		S.panicOn = on
+		safe_set(panicLabel, on and "on" or "off")
+	end,
+})
+
+farmTab:CreateDropdown({
+	Name = "Panic radius",
+	Flag = "PanicRadius",
+	Options = {"30", "50", "80", "120"},
+	CurrentOption = {"50"},
+	Callback = function(sel)
+		local chosen = type(sel) == "table" and sel[1] or sel
+		S.panicRadius = tonumber(chosen) or 50
+	end,
+})
+
+-- Auto sell.
+--
+-- SellTrees lives on LumberMillService and takes "All" or "Held". Selling is
+-- proximity checked — the merchant has to be within reach — so the farm
+-- teleports to the nearest merchant before selling rather than calling it from
+-- wherever it happens to be standing.
+local function sell_logs()
+	local res = call(LumberMillService, "SellTrees", "All")
+	if type(res) == "table" and res.Ok then return true end
+	local res2 = call(LumberMillService, "SellTrees", "Held")
+	if type(res2) == "table" and res2.Ok then return true end
+	return false, type(res) == "table" and res.Reason or "sell refused"
+end
+
+local function nearest_merchant()
+	local best, bestD = nil, math.huge
+	local root = hrp()
+	if not root then return nil end
+	for _, d in ipairs(workspace:GetDescendants()) do
+		if d:IsA("Model") and d.Name:lower():match("merchant") then
+			local ok, pos = pcall(function() return d:GetPivot().Position end)
+			if ok and pos then
+				local dist = (pos - root.Position).Magnitude
+				if dist < bestD then best, bestD = d, dist end
+			end
+		end
+		if d:IsA("BasePart") and d.Name:lower():match("merchant") then
+			local dist = (d.Position - root.Position).Magnitude
+			if dist < bestD then best, bestD = d, dist end
+		end
+	end
+	return best, bestD
+end
+
+local function auto_sell_pass()
+	local merchant, dist = nearest_merchant()
+	if merchant then
+		local ok, pos = pcall(function() return merchant:GetPivot().Position end)
+		if ok and pos then
+			local root = hrp()
+			if root then
+				-- Teleport even when already "close": the server measures
+				-- reach from the position IT has, and a stale one answers
+				-- TooFar even from 5 studs away on the client.
+				root.Anchored = false
+				root.CFrame = CFrame.new(pos + Vector3.new(0, 3, 5))
+				root.AssemblyLinearVelocity = Vector3.zero
+				root.AssemblyAngularVelocity = Vector3.zero
+				task.wait(1.0)
+			end
+		end
+	end
+	-- retry: the first attempt often lands before the move replicates
+	local lastWhy
+	for attempt = 1, 4 do
+		local ok, why = sell_logs()
+		if ok then return true, nil end
+		lastWhy = why
+		task.wait(0.7)
+	end
+	return false, lastWhy
+end
+
+local sellLabel = farmTab:CreateLabel({Name = "off"})
+
+farmTab:CreateToggle({
+	Name = "Auto Sell",
+	Flag = "AutoSell",
+	CurrentValue = false,
+	Callback = function(on)
+		S.autoSell = on
+		safe_set(sellLabel, on and ("at " .. tostring(S.sellAt)) or "off")
+	end,
+})
+
+farmTab:CreateDropdown({
+	Name = "Sell at logs",
+	Flag = "SellAt",
+	Options = {"10", "25", "50", "100", "200"},
+	CurrentOption = {"50"},
+	Callback = function(sel)
+		local chosen = type(sel) == "table" and sel[1] or sel
+		S.sellAt = tonumber(chosen) or 50
+		if S.autoSell then safe_set(sellLabel, "at " .. tostring(S.sellAt)) end
+	end,
+})
+
+farmTab:CreateButton({
+	Name = "Sell now",
+	Callback = function()
+		task.spawn(function()
+			local ok, why = auto_sell_pass()
+			safe_set(sellLabel, ok and "sold" or ("fail: " .. tostring(why):sub(1, 20)))
+		end)
+	end,
+})
+
+farmTab:CreateSection({Name = "Server"})
+farmTab:CreateButton({
+	Name = "Hop to low server",
+	Callback = function()
+		task.spawn(function() hop_to_low_server() end)
+	end,
+})
+
+----------------------------------------------------------------------
+-- quests
+----------------------------------------------------------------------
+-- Quests are handed in per line, at the NPC that owns the line. There is no
+-- bulk-claim remote: QuestService exposes Accept/HandIn/Meet/Track, and HandIn
+-- takes a line id. It answers Ok=false Reason="NotReady" while objectives are
+-- unfinished, which is the normal case, not an error.
+--
+-- HandIn is proximity checked ("Come a little closer"), so a line whose NPC is
+-- far away will refuse. We report per line rather than pretending it worked.
+local function claim_all_quests()
+	local RS = game:GetService("ReplicatedStorage")
+	local Knit = require(RS.Packages.Knit)
+	local QC = require(RS.Modules.QuestConfig)
+	local QS = Knit.GetService("QuestService")
+
+	local claimed, notready, far = 0, 0, 0
+	local notes = {}
+
+	for _, line in ipairs(QC.Lines) do
+		-- Meet opens the line where the game requires an introduction first
+		pcall(function() QS:Meet(line.Id) end)
+		-- Accept any quest the line is offering right now
+		local acc = call(QS, "Accept", line.Id)
+		if type(acc) == "table" and acc.Ok then
+			table.insert(notes, "accept " .. tostring(line.Id))
+		end
+		-- Hand in whatever is finished
+		local res = call(QS, "HandIn", line.Id)
+		if type(res) == "table" then
+			if res.Ok then
+				claimed += 1
+			elseif res.Reason == "NotReady" then
+				notready += 1
+			else
+				far += 1
+			end
+		end
+	end
+
+	local msg = ("%d claimed  %d busy  %d far"):format(claimed, notready, far)
+	if claimed > 0 or #notes > 0 then
+		msg = msg .. "  (" .. table.concat(notes, ", "):sub(1, 60) .. ")"
+	end
+	safe_set(questLabel, msg)
+end
+
+local questLabel = farmTab:CreateLabel({Name = "-"})
+farmTab:CreateButton({
+	Name = "Claim all quests",
+	Callback = function()
+		task.spawn(function() claim_all_quests() end)
+	end,
 })
 
 ----------------------------------------------------------------------
@@ -901,6 +1283,66 @@ axeTab:CreateButton({
 	end,
 })
 
+----------------------------------------------------------------------
+-- Miku teleport
+----------------------------------------------------------------------
+-- Miku is an NPC that only spawns occasionally, so a scan at load time finds
+-- nothing. The search runs when the button is pressed, not when the script
+-- loads. It checks live players first (cheap), then walks workspace for a
+-- spawned Miku model or part.
+----------------------------------------------------------------------
+local function find_miku()
+	-- a player named Miku wins: they move, so teleport to their live position
+	for _, p in ipairs(game.Players:GetPlayers()) do
+		if p ~= plr
+			and (string.lower(p.Name):match("miku") or string.lower(p.DisplayName):match("miku")) then
+			local root = p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+			if root then return root.Position, "player " .. p.Name end
+		end
+	end
+	-- otherwise look for a spawned NPC
+	for _, d in ipairs(workspace:GetDescendants()) do
+		if string.lower(d.Name):match("miku") then
+			local pos
+			if d:IsA("Model") then pos = d:GetPivot().Position
+			elseif d:IsA("BasePart") then pos = d.Position end
+			if pos then return pos, d.Name end
+		end
+	end
+	return nil, nil
+end
+
+-- Teleport without anchoring. An anchored root does not replicate its CFrame,
+-- so the server keeps the old position and every proximity check fails against
+-- it. Set the CFrame on a free root and zero the velocity instead.
+local function teleport_to(pos, offset)
+	local root = hrp()
+	if not root or not pos then return false end
+	root.Anchored = false
+	root.CFrame = CFrame.new(pos + (offset or Vector3.new(0, 3, 4)))
+	root.AssemblyLinearVelocity = Vector3.zero
+	root.AssemblyAngularVelocity = Vector3.zero
+	return true
+end
+
+local mikuLabel
+mikuLabel = axeTab:CreateLabel({Text = "miku: not scanned yet"})
+
+axeTab:CreateButton({
+	Name = "TP to Miku",
+	Callback = function()
+		task.spawn(function()
+			local pos, who = find_miku()
+			if not pos then
+				mikuLabel:Set("miku: not spawned (try again later)")
+				return
+			end
+			local ok = teleport_to(pos)
+			mikuLabel:Set(ok and ("miku: tp -> " .. who) or "miku: tp failed")
+		end)
+	end,
+})
+
 axeTab:CreateParagraph({
 	Title = "How buying works",
 	Content = "The server rejects purchases unless you are standing at the shop, so auto buy travels to the axe's island stall first.",
@@ -967,12 +1409,244 @@ getgenv().ForestFarm = {
 		return {farm = S.farm, autobuy = S.autobuy, felled = stats.felled,
 			failed = stats.failed, rate = rate(), mode = MODES[modeIndex], bucks = bucks()}
 	end,
+	sell = function() return auto_sell_pass() end,
+	quote = function()
+		local q = call(LumberMillService, "Quote")
+		if type(q) == "table" then
+			return {count = q.Count, worth = q.Worth, total = q.Total}
+		end
+		return nil
+	end,
 }
 
 refresh_state()
 refresh_axe_info()
 refresh_ladder()
-pcall(function()
-	Window:Notify({Title = "Foresters", Content = "Farm hub ready", Duration = 4})
+
+----------------------------------------------------------------------
+-- compact layout
+----------------------------------------------------------------------
+-- Tried splitting the tab into two columns. Measured result: the window is only
+-- 339px wide on this device, so each column ended up 144px — narrower than a
+-- single readable control, which read as cramped and stacked. Two columns are a
+-- downgrade at phone width. Reverted to one column and tightened the vertical
+-- rhythm instead, which is what actually made it look heavy.
+--
+-- Removes leftover split artifacts if an older run created them.
+local function compact_tab(tabName)
+	local win = S.window
+	if not win or not win.Content then return false end
+	local tab = win.Content:FindFirstChild(tabName)
+	if not tab then return false end
+	local scroll
+	for _, ch in ipairs(tab:GetChildren()) do
+		if ch:IsA("ScrollingFrame") then scroll = ch break end
+	end
+	if not scroll then return false end
+
+	-- undo any columns from an earlier version: lift their rows back out
+	for _, col in ipairs({scroll:FindFirstChild("ColLeft"), scroll:FindFirstChild("ColRight")}) do
+		if col then
+			for _, row in ipairs(col:GetChildren()) do
+				if row:IsA("Frame") or row:IsA("TextLabel") or row:IsA("TextButton") then
+					row.Parent = scroll
+				end
+			end
+			col:Destroy()
+		end
+	end
+
+	local rows = {}
+	for _, ch in ipairs(scroll:GetChildren()) do
+		if ch:IsA("Frame") or ch:IsA("TextLabel") or ch:IsA("TextButton") then
+			table.insert(rows, ch)
+		end
+	end
+	if #rows < 4 then return false end
+	for _, row in ipairs(rows) do row.Parent = nil end
+
+	-- Kill Airflow's own list layout. It forces every child into one vertical
+	-- stack and overrides any Position we set, which is why the first attempt
+	-- looked like "everything on the left" — the columns were placed correctly
+	-- but the parent's UIListLayout re-stacked them anyway.
+	local oldLay = scroll:FindFirstChildOfClass("UIListLayout")
+	if oldLay then oldLay:Destroy() end
+
+	-- Airflow's scroll padding is L=24 R=24. On a 339px scroller that is 48px
+	-- — 14% of the width — and it silently ate the space the second column
+	-- needed, so the columns overlapped by ~11px. Reclaim it.
+	local pad = scroll:FindFirstChildOfClass("UIPadding")
+	if pad then
+		pad.PaddingLeft = UDim.new(0, 4)
+		pad.PaddingRight = UDim.new(0, 4)
+		pad.PaddingTop = UDim.new(0, 4)
+		pad.PaddingBottom = UDim.new(0, 4)
+	end
+
+	-- Column maths, done against the width that is actually usable.
+	-- With gutter g and usable width W: each column is (W-g)/2, the left sits
+	-- at 0, the right at (W+g)/2. Expressed in scale so the split survives any
+	-- window size, and with the gutter subtracted in pixels so it never
+	-- collapses to zero on a narrow screen.
+	local gutter = 14
+	local colW = UDim.new(0.5, -gutter / 2)
+	local rightX = UDim.new(0.5, gutter / 2)
+
+	local function makeCol(name, x)
+		local col = Instance.new("Frame")
+		col.Name = name
+		col.BackgroundTransparency = 1
+		col.Size = UDim2.new(colW.Scale, colW.Offset, 0, 0)
+		col.Position = UDim2.new(x.Scale, x.Offset, 0, 0)
+		col.Parent = scroll
+		local lay = Instance.new("UIListLayout")
+		lay.SortOrder = Enum.SortOrder.LayoutOrder
+		lay.Padding = UDim.new(0, 6)
+		lay.Parent = col
+		return col
+	end
+	local left = makeCol("ColLeft", UDim.new(0, 0))
+	local right = makeCol("ColRight", rightX)
+
+	-- Group by section, not by row. Alternating per row tore sections in half:
+	-- measured "SESSION" heading landing in the right column while its labels
+	-- sat in the left. A heading has to stay with the controls under it.
+	local function isHeading(row)
+		if not row:IsA("TextLabel") and not row:IsA("Frame") then return false end
+		for _, d in ipairs(row:GetDescendants()) do
+			if d:IsA("TextLabel") and d.Text ~= "" then
+				return d.Text == string.upper(d.Text) and #d.Text < 24
+			end
+		end
+		return false
+	end
+
+	local groups, current = {}, nil
+	for _, row in ipairs(rows) do
+		if isHeading(row) then
+			current = {heading = row, items = {}}
+			table.insert(groups, current)
+		elseif current then
+			table.insert(current.items, row)
+		else
+			if not groups[1] then table.insert(groups, {heading = nil, items = {}}) end
+			table.insert(groups[1].items, row)
+		end
+	end
+
+	-- balance: whichever column is shorter takes the next section
+	local function height(col)
+		local y = 0
+		for _, ch in ipairs(col:GetChildren()) do
+			if ch:IsA("Frame") or ch:IsA("TextLabel") or ch:IsA("TextButton") then
+				y += (ch.AbsoluteSize.Y > 0 and ch.AbsoluteSize.Y or 30) + 6
+			end
+		end
+		return y
+	end
+
+	local order = 0
+	local function place(row, col)
+		order += 1
+		row.LayoutOrder = order
+		-- Width only. Forcing the height clamped every row into 24-32px, and
+		-- Airflow's dropdowns are taller than that — the header got crushed and
+		-- the option list spilled over the row below, which is the collision the
+		-- Captain kept hitting. Their natural height is correct as built.
+		row.Size = UDim2.new(1, 0, row.Size.Y.Scale, row.Size.Y.Offset)
+		row.ClipsDescendants = false
+		row.Parent = col
+	end
+	local function colHeight(col)
+		local y = 0
+		for _, ch in ipairs(col:GetChildren()) do
+			if ch:IsA("Frame") or ch:IsA("TextLabel") or ch:IsA("TextButton") then
+				y += (ch.AbsoluteSize.Y > 0 and ch.AbsoluteSize.Y or 30) + 6
+			end
+		end
+		return y
+	end
+
+	-- Small sections stay whole — a heading torn away from its controls was the
+	-- earlier complaint. Anything long enough to unbalance the columns (the axe
+	-- ladder is 12 rows on its own, which produced a 4/15 split) is poured in
+	-- one row at a time into whichever column is currently shorter.
+	local WHOLE_LIMIT = 4
+	for _, group in ipairs(groups) do
+		if #group.items <= WHOLE_LIMIT then
+			local target = (colHeight(left) <= colHeight(right)) and left or right
+			if group.heading then place(group.heading, target) end
+			for _, item in ipairs(group.items) do place(item, target) end
+		else
+			local first = true
+			for _, item in ipairs(group.items) do
+				local target = (colHeight(left) <= colHeight(right)) and left or right
+				if first and group.heading then
+					-- the heading rides with the first row it introduces
+					place(group.heading, target)
+					first = false
+				end
+				place(item, target)
+			end
+		end
+	end
+
+	task.defer(function()
+		local function fit(col)
+			local y = 0
+			for _, ch in ipairs(col:GetChildren()) do
+				if ch:IsA("Frame") or ch:IsA("TextLabel") or ch:IsA("TextButton") then
+					y += ch.AbsoluteSize.Y + 6
+				end
+			end
+			col.Size = UDim2.new(colW.Scale, colW.Offset, 0, y)
+			return y
+		end
+		local ly, ry = fit(left), fit(right)
+		scroll.CanvasSize = UDim2.new(0, 0, 0, math.max(ly, ry) + 8)
+	end)
+	return true
+end
+
+task.defer(function()
+	pcall(function() compact_tab("Farm") end)
+	pcall(function() compact_tab("Axes") end)
 end)
-print("[FarmHub] loaded")
+
+-- Drive the on-screen clamp from here, once every tab and control exists.
+-- Verified against the live client: applied this way it holds at absY=6 for at
+-- least six seconds, i.e. Airflow does not re-centre afterwards. It retries
+-- because the Frame takes a moment to appear even at this point.
+task.spawn(function()
+	for i = 1, 40 do
+		local applied = false
+		pcall(function()
+			local main
+			for _, ch in ipairs(Window.Gui:GetChildren()) do
+				if ch:IsA("Frame") then main = ch break end
+			end
+			if not main then return end
+			local vp = workspace.CurrentCamera.ViewportSize
+			if main.AbsoluteSize.Y > vp.Y - 16 then
+				local k = (vp.Y - 16) / main.AbsoluteSize.Y
+				main.Size = UDim2.new(main.Size.X.Scale, main.Size.X.Offset * k,
+					main.Size.Y.Scale, main.Size.Y.Offset * k)
+				return
+			end
+			local curAbsX, curAbsY = main.AbsolutePosition.X, main.AbsolutePosition.Y
+			local wantLeft = math.max(4, (vp.X - main.AbsoluteSize.X) / 2)
+			main.Position = UDim2.new(main.Position.X.Scale,
+				main.Position.X.Offset + (wantLeft - curAbsX),
+				main.Position.Y.Scale,
+				main.Position.Y.Offset + (6 - curAbsY))
+			applied = (math.abs(main.AbsolutePosition.Y - 6) < 2)
+		end)
+		if applied then break end
+		task.wait(0.25)
+	end
+end)
+
+pcall(function()
+	Window:Notify({Title = "Blizzard", Content = "Farm hub ready", Duration = 4})
+end)
+print("[Blizzard] loaded")
