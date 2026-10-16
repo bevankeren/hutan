@@ -2439,12 +2439,44 @@ local function sync_state_from_flags()
 		F = getgenv().__Airflow and getgenv().__Airflow.Flags
 	end
 	if type(F) ~= "table" then return end
+	-- *Get() returns nil for a dropdown that holds a pick, so read the option
+	-- list and match the stored index instead. This was silently leaving
+	-- S.minTier at 0, which meant the rarity floor never applied after a config
+	-- load -- the Captain's "filter is broken" report.*
 	local function val(flag)
 		local f = F[flag]
-		if not f or type(f.Get) ~= "function" then return nil end
-		local ok, v = pcall(function() return f:Get() end)
-		return ok and v or nil
+		if not f then return nil end
+		if type(f.Get) == "function" then
+			local ok, v = pcall(function() return f.Get() end)
+			if ok and v ~= nil then return v end
+		end
+		-- *Get() yields nil for a dropdown holding a pick, so scan the flag's own
+		-- fields for the stored option. This was leaving S.minTier at 0 forever,
+		-- meaning the rarity floor silently never applied.*
+		if type(f.GetOptions) == "function" then
+			local okO, opts = pcall(function() return f.GetOptions(f) end)
+			if okO and type(opts) == "table" then
+				local scan = {}
+				for k, v in pairs(f) do
+					if type(v) == "string" then scan[v] = true end
+				end
+				for _, o in ipairs(opts) do
+					if scan[tostring(o)] then return tostring(o) end
+				end
+				-- numeric index fallback, for flags that store a position
+				for k, v in pairs(f) do
+					local n = tonumber(v)
+					if n and opts[math.floor(n)] and type(k) == "string" and k:match("[Ii]ndex") then
+						return tostring(opts[math.floor(n)])
+					end
+				end
+			end
+		end
+		return nil
 	end
+	-- *only write when a real value was read. The MinRarity dropdown in this library
+	-- build throws on GetOptions, so an unreadable flag must leave S.minTier alone
+	-- rather than resetting the floor to 0.*
 	local v = val("MinRarity")
 	if type(v) == "string" then
 		S.minTier = (v == "Any") and 0 or (RARITY_TIER[v] or 0)
