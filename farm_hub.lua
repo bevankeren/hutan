@@ -32,6 +32,51 @@ local AxePrice = require(RS.Modules.Lumber.AxePrice)
 local ChopTuning = require(RS.Modules.Lumber.ChopTuning)
 
 ----------------------------------------------------------------------
+-- auto perfect (Legit tab)
+----------------------------------------------------------------------
+-- The chop minigames (Chop / Swing / Notch) are client-side simulations. Each
+-- ends in onFinish(done, perfect), and ChopController forwards those straight
+-- into TreeService:FinishChop(tree, done, perfect) — the server trusts the
+-- claimed perfect flag. Verified live: a call sent as FinishChop(tree, true,
+-- false) through this wrapper comes back Ok=true, Felled=true.
+--
+-- The wrapper only upgrades a *successful* chop (done=true) to perfect. Failed
+-- chops (done=false, "the tree held on") pass through untouched, so the feature
+-- reads as playing the minigame well rather than felling trees that were never
+-- cut. Toggling off or unloading restores the original method.
+local PERF_KEY = "__BlizzardPerfHook"
+
+local function perfect_hook_install()
+	if getgenv()[PERF_KEY] then return true end
+	local old = TreeService.FinishChop
+	local state = {old = old, count = 0}
+	TreeService.FinishChop = function(self, tree, done, perfect, ...)
+		if done and not perfect then
+			perfect = true
+			state.count += 1
+		end
+		return old(self, tree, done, perfect, ...)
+	end
+	getgenv()[PERF_KEY] = state
+	return true
+end
+
+local function perfect_hook_remove()
+	local state = getgenv()[PERF_KEY]
+	if not state then return false end
+	-- only restore if nobody stacked another wrapper on top of ours
+	if TreeService.FinishChop == state.old or type(state.old) == "function" then
+		pcall(function() TreeService.FinishChop = state.old end)
+	end
+	getgenv()[PERF_KEY] = nil
+	return true
+end
+
+local function perfect_hook_active()
+	return getgenv()[PERF_KEY] ~= nil
+end
+
+----------------------------------------------------------------------
 -- unload any previous run
 ----------------------------------------------------------------------
 do
@@ -42,11 +87,20 @@ do
 		prev.token = (prev.token or 0) + 1
 		prev.farm = false
 		prev.autobuy = false
+		prev.perfectOn = false
 		local ok, old = pcall(function() return getgenv().ForestFarm end)
 		if ok and type(old) == "table" and type(old.stop) == "function" then
 			pcall(old.stop)
 		end
 	end
+	-- undo the auto-perfect wrapper so the next run hooks a clean method
+	pcall(function()
+		local state = getgenv().__BlizzardPerfHook
+		if state and type(state.old) == "function" then
+			TreeService.FinishChop = state.old
+		end
+		getgenv().__BlizzardPerfHook = nil
+	end)
 	-- tear down ONLY the window this script created. Destroying every ScreenGui
 	-- here used to wipe the player's own HUD (on mobile especially), because the
 	-- game's interface lives in ScreenGuis of its own. We now keep a reference to
@@ -832,6 +886,7 @@ end
 
 local farmTab = Window:CreateTab({Name = "Farm", Icon = "tree-pine"})
 local axeTab = Window:CreateTab({Name = "Axes", Icon = "axe"})
+local legitTab = Window:CreateTab({Name = "Legit", Icon = "shield"})
 
 farmTab:CreateSection({Name = "Farm"})
 -- Labels carry bare values, not "state: idle" prose. The Captain wants the
@@ -849,6 +904,30 @@ axeTab:CreateSection({Name = "Axes"})
 local buyLabel = axeTab:CreateLabel({Name = "off"})
 local buyLogLabel = axeTab:CreateLabel({Name = "-"})
 axeTab:CreateSection({Name = "Ladder"})
+
+legitTab:CreateSection({Name = "Perfect"})
+local perfLabel = legitTab:CreateLabel({Name = "off"})
+legitTab:CreateToggle({
+	Name = "Auto Perfect",
+	Callback = function(on)
+		S.perfectOn = on
+		if on then
+			perfect_hook_install()
+			pcall(function() perfLabel:Set("on") end)
+			task.spawn(function()
+				local myToken = S.token
+				while S.perfectOn and S.token == myToken do
+					local state = getgenv().__BlizzardPerfHook
+					pcall(function() perfLabel:Set("on  " .. tostring(state and state.count or 0)) end)
+					task.wait(1)
+				end
+			end)
+		else
+			perfect_hook_remove()
+			pcall(function() perfLabel:Set("off") end)
+		end
+	end,
+})
 
 local stats = {felled = 0, failed = 0, startedAt = 0, blocked = {}}
 local modeIndex = 1
@@ -1611,6 +1690,7 @@ end
 task.defer(function()
 	pcall(function() compact_tab("Farm") end)
 	pcall(function() compact_tab("Axes") end)
+	pcall(function() compact_tab("Legit") end)
 end)
 
 -- Drive the on-screen clamp from here, once every tab and control exists.
