@@ -1346,6 +1346,8 @@ local okTop, errTop = pcall(function()
 		topRows[i] = row
 		row.button = gbTop:CreateButton({
 			Name = "…",
+			-- *fixed-width label with ellipsis: a long row used to stretch the button,
+			-- which widened the groupbox and made the whole column jump around*
 			Callback = function()
 				local t = row.tree
 				if S.sniping then return end
@@ -1412,6 +1414,20 @@ local okTop, errTop = pcall(function()
 		-- *hidden rows are destroyed rather than left blank, so shrinking the count
 		-- leaves no dead buttons between the last result and the controls below*
 		pcall(function() row.button:SetVisible(false) end)
+		-- *pin the label so a long row can never stretch the button and shove the
+		-- neighbouring column. TextFits was returning inconsistently, which is what
+		-- made the column width jump on every refresh.*
+		pcall(function()
+			local title = row.button._title
+			title.Size = UDim2.new(1, -8, 1, 0)
+			title.AnchorPoint = Vector2.new(0, 0.5)
+			title.Position = UDim2.new(0, 4, 0.5, 0)
+			title.TextXAlignment = Enum.TextXAlignment.Left
+			title.TextYAlignment = Enum.TextYAlignment.Center
+			title.TextTruncate = Enum.TextTruncate.AtEllipsis
+			title.TextWrapped = false
+			title.RichText = true
+		end)
 	end
 	getgenv().__TopRows = nil
 	getgenv().__TopRowsV2 = topRows
