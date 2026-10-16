@@ -1595,16 +1595,30 @@ local function set_farm(on)
 				refresh_axe_info()
 				-- Logs enter the inventory on their own when a tree is felled.
 				-- Quote read Count=0 Worth=0 before any chop and Count=1
-				-- Worth=47 right after one, so no pickup call is needed here —
-				-- SawmillService:PickUp answers "There's no sawmill there" for
-				-- most biomes anyway. Just count and sell at the threshold.
+				-- Worth=47 right after one, so no pickup call is needed here.
+				--
+				-- Sell threshold counts HELD LOGS, not felled trees: one tree
+				-- yields several logs, so a tree counter sold at "50" only
+				-- once the inventory was well past 80. Quote.Count is the
+				-- server's held-log count and is readable from anywhere; the
+				-- old tree counter stays as fallback when Quote misbehaves.
 				if S.autoSell then
-					S.logCount = (S.logCount or 0) + 1
-					if S.logCount >= (S.sellAt or 50) then
-						S.logCount = 0
+					local held
+					local okQ, q = pcall(function() return call(LumberMillService, "Quote") end)
+					if okQ and type(q) == "table" and type(q.Count) == "number" then
+						held = q.Count
+						S.logCount = held
+					else
+						S.logCount = (S.logCount or 0) + 1
+						held = S.logCount
+					end
+					safe_set(sellLabel, ("%d / %d"):format(held, S.sellAt or 50))
+					if held >= (S.sellAt or 50) then
+						safe_set(sellLabel, "selling…")
 						task.spawn(function()
 							local okSell, why = auto_sell_pass()
-							safe_set(sellLabel, okSell and ("sold @ " .. tostring(stats.felled)) or ("fail: " .. tostring(why):sub(1, 16)))
+							if okSell then S.logCount = 0 end
+							safe_set(sellLabel, okSell and "sold" or ("fail: " .. tostring(why):sub(1, 16)))
 						end)
 					end
 				end
