@@ -123,6 +123,7 @@ S.topSort = type(S.topSort) == "string" and S.topSort or "Money"
 S.minValue = tonumber(S.minValue) or 0
 S.maxRows = tonumber(S.maxRows) or 8
 S.weightValue = type(S.weightValue) == "number" and S.weightValue or 0.6
+S.includeGrowing = S.includeGrowing == true
 do
 	local e = S.esp
 	e.players = e.players or false
@@ -478,6 +479,35 @@ local function is_live(tree)
 	if st == "Ready" then return true end
 	if st == "Locked" and tree:GetAttribute("LockedBy") == plr.UserId then return true end
 	return false
+end
+
+-- *Growing trees keep their full Rarity/Weight/Scale attributes, so a Mythic can be
+-- scouted before it is choppable. GrowStart is an os.time() epoch stamp, GrowSeconds
+-- the duration — both verified against live trees.*
+local function is_growing(tree)
+	return tree:GetAttribute("State") == "Growing"
+end
+
+local function grow_remaining(tree)
+	local start = tonumber(tree:GetAttribute("GrowStart"))
+	local dur = tonumber(tree:GetAttribute("GrowSeconds"))
+	if not start or not dur then return nil end
+	return (start + dur) - os.time()
+end
+
+local function fmt_remaining(sec)
+	if sec == nil then return "?" end
+	if sec <= 0 then return "now" end
+	if sec < 60 then return ("%ds"):format(math.floor(sec + 0.5)) end
+	local m = math.floor(sec / 60)
+	local s = math.floor(sec % 60)
+	return ("%dm%02ds"):format(m, s)
+end
+
+-- what the table may show: Ready, our own Locked, and Growing when the toggle is on
+local function is_candidate(tree)
+	if is_live(tree) then return true end
+	return S.includeGrowing and is_growing(tree)
 end
 
 local function held_axe_id()
@@ -1312,12 +1342,49 @@ local okTop, errTop = pcall(function()
 			Callback = function()
 				local t = row.tree
 				if S.sniping then return end
-				if not (t and t.Parent and t:FindFirstChild("Trunk") and is_live(t)) then
+				if not (t and t.Parent and t:FindFirstChild("Trunk") and is_candidate(t)) then
 					safe_set(topLabel, "gone — pick another")
 					return
 				end
 				S.sniping = true
-				safe_set(topLabel, "sniping " .. tostring(t:GetAttribute("Wood") or t.Name) .. "…")
+				local woodName = tostring(t:GetAttribute("Wood") or t:GetAttribute("Species") or t.Name)
+				-- *growing target: teleport now and camp it, so we chop the instant it
+				-- flips to Ready instead of losing it to whoever wanders past*
+				if is_growing(t) then
+					safe_set(topLabel, ("camping %s — %s"):format(woodName, fmt_remaining(grow_remaining(t))))
+					task.spawn(function()
+						local okP, result = pcall(function()
+							teleport_to(t.Trunk.Position, Vector3.new(0, 3, 5))
+							task.wait(0.4)
+							local deadline = os.clock() + math.max(grow_remaining(t) or 0, 0) + 30
+							while t.Parent and os.clock() < deadline do
+								if not is_growing(t) then break end
+								local left = grow_remaining(t)
+								if left and left > 0 then
+									safe_set(topLabel, ("waiting %s — %s"):format(woodName, fmt_remaining(left)))
+								end
+								task.wait(0.5)
+							end
+							if not (t.Parent and is_live(t)) then
+								return false, "grew but not choppable"
+							end
+							return chop_tree(t)
+						end)
+						local good, why = false, "threw"
+						if okP then
+							good, why = result, nil
+							if type(result) == "table" then good, why = true, nil end
+						end
+						if good then
+							safe_set(topLabel, ("sniped %s"):format(woodName))
+						else
+							safe_set(topLabel, ("fail: %s"):format(tostring(okP and why or result):sub(1, 22)))
+						end
+						S.sniping = false
+					end)
+					return
+				end
+				safe_set(topLabel, "sniping " .. woodName .. "…")
 				task.spawn(function()
 					local good, result
 					local okP = pcall(function()
@@ -1327,7 +1394,7 @@ local okTop, errTop = pcall(function()
 						good, result = chop_tree(t)
 					end)
 					if okP and good then
-						safe_set(topLabel, ("sniped %s"):format(tostring(t:GetAttribute("Wood") or t.Name)))
+						safe_set(topLabel, ("sniped %s"):format(woodName))
 					else
 						safe_set(topLabel, "fail: " .. tostring(okP and result or "chop threw"):sub(1, 18))
 					end
@@ -1764,6 +1831,20 @@ gbFarm:CreateSlider({
 	Callback = function(n) S.refreshRate = n end,
 })
 
+-- *growing trees keep their Rarity/Weight/Size, so a Mythic can be scouted before it
+-- ripens: rows show a countdown and snipe camps the tree until it flips to Ready*
+gbFarm:CreateToggle({
+	Name = "Include growing",
+	Flag = "IncludeGrowing",
+	CurrentValue = S.includeGrowing or false,
+	Callback = function(on)
+		S.includeGrowing = on
+		if topLabel then
+			safe_set(topLabel, on and "growing trees included" or "growing trees hidden")
+		end
+	end,
+})
+
 gbFarm:CreateToggle({
 	Name = "Panic Mode",
 	Flag = "PanicMode",
@@ -2145,8 +2226,12 @@ local function top_wood_row_text(t, dist)
 	local names = mutation_names(t)
 	local mutTxt = #names > 0 and ("  +" .. table.concat(names, "+")) or ""
 	local d = dist and ("  %dm"):format(dist) or ""
-	return ("%s · %s · %s · %s%s%s%s"):format(
-		rarity, fmt_val(money), wood, fmt_odds(odds), sizeTxt, mutTxt, d)
+	local growing = is_growing(t)
+	-- *a growing tree can't be chopped yet, so it carries its countdown instead of
+	-- pretending to be snipeable — TP there early, then wait it out*
+	local status = growing and ("  ⏳ Growing %s"):format(fmt_remaining(grow_remaining(t))) or ""
+	return ("%s · %s · %s · %s%s%s%s%s"):format(
+		rarity, fmt_val(money), wood, fmt_odds(odds), sizeTxt, mutTxt, status, d)
 end
 
 local function visible_top_rows()
@@ -2167,7 +2252,7 @@ task.spawn(function()
 			local minValue = tonumber(S.minValue) or 0
 			local list = {}
 			for _, t in ipairs(folder:GetChildren()) do
-				if t:IsA("Model") and t:FindFirstChild("Trunk") and is_live(t) and passes_rarity(t) then
+				if t:IsA("Model") and t:FindFirstChild("Trunk") and is_candidate(t) and passes_rarity(t) then
 					local v = tree_value(t, S.perfectOn)
 					-- *sub-dollar trees are always junk regardless of the slider*
 					if v >= minValue and v >= 1 then
@@ -2208,15 +2293,21 @@ task.spawn(function()
 							d = math.floor((t.Trunk.Position - myRoot.Position).Magnitude)
 						end
 						pcall(function() row.button:SetText(top_wood_row_text(t, d)) end)
+						-- *a growing row would fail StartChop, so grey it out until it ripens*
+						pcall(function() row.button:SetDisabled(is_growing(t)) end)
 					else
 						pcall(function() row.button:SetText("—") end)
+						pcall(function() row.button:SetDisabled(true) end)
 					end
 				end
 			end
 			if topLabel then
 				local mode = (S.topSort == "Odds" and "by odds") or (S.topSort == "Rarity" and "by rarity") or "by value"
-				safe_set(topLabel, ("%d shown · %d live · %s · %.1fs"):format(
-					math.min(want, #list), #list, mode, tonumber(S.refreshRate) or 1))
+				local growing = 0
+				for _, t in ipairs(list) do if is_growing(t) then growing += 1 end end
+				local growTxt = growing > 0 and (" · %d growing"):format(growing) or ""
+				safe_set(topLabel, ("%d shown · %d live%s · %s · %.1fs"):format(
+					math.min(want, #list), #list, growTxt, mode, tonumber(S.refreshRate) or 1))
 			end
 		end
 		task.wait(math.clamp(tonumber(S.refreshRate) or 1, 0.25, 10))
