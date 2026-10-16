@@ -423,6 +423,17 @@ local function sell_value_of(tree)
 	return weight * mult
 end
 
+-- Rarity odds: WoodConfig.Rarities carries Chance as a spawn fraction
+-- (Common 0.5976, Legendary 0.009, Secret 0.0001), so the "1 in N" reading is
+-- 1/chance — bigger N, rarer tree. The Top-wood ranking is odds-first; price
+-- only breaks ties between trees of the same rarity.
+local function rarity_odds(tree)
+	local info = rarity_info(tree:GetAttribute("Rarity"))
+	local chance = tonumber(info and info.Chance) or 1
+	if chance <= 0 then chance = 1 end
+	return 1 / chance
+end
+
 local function is_live(tree)
 	local st = tree:GetAttribute("State")
 	if st == "Ready" then return true end
@@ -2253,6 +2264,8 @@ refresh_ladder()
 local function top_wood_row_text(t, dist)
 	local wood = t:GetAttribute("Wood") or t.Name
 	local rarity = tostring(t:GetAttribute("Rarity") or "?")
+	local odds = math.floor(rarity_odds(t) + 0.5)
+	local oddsTxt = ("1/%s"):format(odds)
 	local muts = t:GetAttribute("Mutations")
 	local mutTxt = ""
 	if type(muts) == "table" then
@@ -2265,8 +2278,8 @@ local function top_wood_row_text(t, dist)
 	end
 	local state = tostring(t:GetAttribute("State") or "?")
 	local d = dist and ("  %dm"):format(dist) or ""
-	return ("%s  ·  %s  ·  %s%s  ·  %s%s"):format(
-		wood, rarity, fmt_val(sell_value_of(t)), mutTxt, state, d)
+	return ("%s  ·  %s %s  ·  %s%s  ·  %s%s"):format(
+		wood, oddsTxt, rarity, fmt_val(sell_value_of(t)), mutTxt, state, d)
 end
 
 task.spawn(function()
@@ -2281,10 +2294,13 @@ task.spawn(function()
 					list[#list+1] = t
 				end
 			end
-			-- rank by the merchant's honest price (weight x rarity multiplier),
-			-- not the multiplier product — weight is the per-tree swing that
-			-- makes one Birch worth triple another
-			table.sort(list, function(a, b) return sell_value_of(a) > sell_value_of(b) end)
+			-- odds-first: 1/chance is the rarity the game actually rolls with
+			-- (Secret 1/10000 tops any price), price breaks same-rarity ties
+			table.sort(list, function(a, b)
+				local oa, ob = rarity_odds(a), rarity_odds(b)
+				if oa ~= ob then return oa > ob end
+				return sell_value_of(a) > sell_value_of(b)
+			end)
 			for i = 1, 6 do
 				local row = rows[i]
 				if row then
