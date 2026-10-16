@@ -1157,7 +1157,10 @@ local function chop_tree(tree)
 	local t0 = os.clock()
 	local finish, last
 	while true do
-		if not S.farm or not alive() then
+		-- S.sniping lets a Top-wood one-shot ride this same lane: without it a
+		-- snipe with the farm toggle OFF starts the chop and instantly cancels
+		-- here — which read as "teleports but never chops"
+		if (not S.farm and not S.sniping) or not alive() then
 			-- only a real stop cancels, and even then we leave the tree alone:
 			-- the server releases the lock on its own once the session times out
 			return false, "cancelled"
@@ -1317,8 +1320,14 @@ local Window = Airflow:CreateWindow({
 	LoadingSubtitle = "Foresters",
 	Icon = "trees",
 	ToggleUIKeybind = "RightShift",
-	Size = UDim2.fromOffset(760, 340),
-	Density = "Compact",
+	-- AdaptiveSize shrinks the whole window on this small screen, which read as
+	-- a squashed thumbnail. Fixed size + a UI scale bump instead: 585x290 at
+	-- UIScale 1.2 renders about 702x348 — comfortably inside the 758x358
+	-- usable area, with visibly larger text than the compact default.
+	AdaptiveSize = false,
+	UIScale = 1.2,
+	Density = "Default",
+	Size = UDim2.fromOffset(585, 290),
 	ConfigurationSaving = {Enabled = true, FolderName = "ForestersHub"},
 })
 -- remember it so the next run unloads exactly this window and nothing else
@@ -2236,6 +2245,30 @@ refresh_ladder()
 -- Top wood live ranking: re-scan, re-rank, rewrite the six rows every 2s.
 -- Value-ranked across the WHOLE map (distance is shown, not filtered) — the
 -- point of the list is finding the best tree anywhere, then sniping it.
+-- Top wood live ranking: re-scan, re-rank, rewrite the six rows every 2s.
+-- Row text is deliberately dense: species, rarity, the merchant's price
+-- (weight x rarity multiplier), mutation names, live state and distance —
+-- everything needed to decide "is this row worth a teleport" without opening
+-- anything else.
+local function top_wood_row_text(t, dist)
+	local wood = t:GetAttribute("Wood") or t.Name
+	local rarity = tostring(t:GetAttribute("Rarity") or "?")
+	local muts = t:GetAttribute("Mutations")
+	local mutTxt = ""
+	if type(muts) == "table" then
+		local names = {}
+		for _, idx in ipairs(muts) do
+			local mi = mutation_info(idx)
+			if mi then names[#names+1] = mi.Name:sub(1, 5) end
+		end
+		if #names > 0 then mutTxt = "  " .. table.concat(names, "+") end
+	end
+	local state = tostring(t:GetAttribute("State") or "?")
+	local d = dist and ("  %dm"):format(dist) or ""
+	return ("%s  ·  %s  ·  %s%s  ·  %s%s"):format(
+		wood, rarity, fmt_val(sell_value_of(t)), mutTxt, state, d)
+end
+
 task.spawn(function()
 	while alive() do
 		local rows = getgenv().__TopRows
@@ -2257,18 +2290,12 @@ task.spawn(function()
 				if row then
 					local t = list[i]
 					row.tree = t
+					local d
 					if t and myRoot then
-						local d = math.floor((t.Trunk.Position - myRoot.Position).Magnitude)
-						pcall(function() row.button:SetText(("%s  %s  %s  %dm"):format(
-							tostring(t:GetAttribute("Wood") or t.Name),
-							fmt_val(sell_value_of(t)),
-							tostring(t:GetAttribute("State") or "?"),
-							d)) end)
-					elseif t then
-						pcall(function() row.button:SetText(("%s  %s  %s"):format(
-							tostring(t:GetAttribute("Wood") or t.Name),
-							fmt_val(sell_value_of(t)),
-							tostring(t:GetAttribute("State") or "?"))) end)
+						d = math.floor((t.Trunk.Position - myRoot.Position).Magnitude)
+					end
+					if t then
+						pcall(function() row.button:SetText(top_wood_row_text(t, d)) end)
 					else
 						pcall(function() row.button:SetText("-") end)
 					end
