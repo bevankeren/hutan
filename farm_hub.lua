@@ -2246,8 +2246,70 @@ local function visible_top_rows()
 	return math.clamp(n, 1, MAX_TOP_ROWS)
 end
 
--- *the Captain asked for every-second refresh: the loop is now driven by S.refreshRate
--- and re-sorts from live attributes, so a Mythic that just spawned climbs immediately*
+local lastTopLabelText = nil
+
+-- *stable rendering: the old build reassigned every row by index each tick and called
+-- SetText unconditionally, so a one-place shift in the ranking rewrote all 12 rows and
+-- the whole table flashed. This diffs against what is already on screen and only
+-- touches rows whose tree, text, visibility or disabled state actually changed.*
+local rowState = {}
+
+-- quantised so near-ties stop trading places every tick; TreeId is the fixed tiebreak
+local function rank_key(t)
+	if S.topSort == "Odds" then
+		return math.floor(tree_odds(t) * 20) / 20
+	elseif S.topSort == "Rarity" then
+		return tier_of(t:GetAttribute("Rarity")) * 1000 + math.floor(tree_value(t, S.perfectOn) / 50)
+	end
+	return math.floor(top_score(t) * 100) / 100
+end
+
+local function tree_sort_id(t)
+	return tonumber(t:GetAttribute("TreeId")) or 0
+end
+
+-- *hysteresis: a challenger must beat the incumbent by a margin before it takes the
+-- slot. Without this, two near-equal trees swap places on every 1s tick and the table
+-- crawls even though nothing meaningful changed.*
+local RANK_EPSILON = 0.02
+local lastOrder = {}
+local lastGoodList = nil
+
+local function apply_hysteresis(sorted)
+	local out = {}
+	local used = {}
+	-- incumbents keep their slot unless clearly beaten
+	for pos, id in ipairs(lastOrder) do
+		if pos > #sorted then break end
+		local inc = nil
+		for _, t in ipairs(sorted) do
+			if not used[t] and tree_sort_id(t) == id then inc = t break end
+		end
+		if not inc then continue end
+		local challenger = nil
+		for _, t in ipairs(sorted) do
+			if not used[t] and tree_sort_id(t) ~= id then challenger = t break end
+		end
+		if challenger and (rank_key(challenger) - rank_key(inc)) > RANK_EPSILON then
+			out[pos] = challenger
+			used[challenger] = true
+		else
+			out[pos] = inc
+			used[inc] = true
+		end
+	end
+	-- fill any remaining slots in sorted order
+	for _, t in ipairs(sorted) do
+		if not used[t] then
+			out[#out+1] = t
+			used[t] = true
+		end
+	end
+	lastOrder = {}
+	for _, t in ipairs(out) do lastOrder[#lastOrder+1] = tree_sort_id(t) end
+	return out
+end
+
 task.spawn(function()
 	local myToken = S.token
 	while alive() and S.token == myToken do
@@ -2255,7 +2317,6 @@ task.spawn(function()
 		local folder = workspace:FindFirstChild("Map") and workspace.Map:FindFirstChild("Trees")
 		if rows and folder then
 			local myRoot = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
-			local minTier = tonumber(S.minTier) or 0
 			local minValue = tonumber(S.minValue) or 0
 			local list = {}
 			for _, t in ipairs(folder:GetChildren()) do
@@ -2267,45 +2328,64 @@ task.spawn(function()
 					end
 				end
 			end
-			local sortMode = S.topSort
 			table.sort(list, function(a, b)
-				if sortMode == "Odds" then
-					local oa, ob = tree_odds(a), tree_odds(b)
-					if oa ~= ob then return oa > ob end
-					return tree_value(a, S.perfectOn) > tree_value(b, S.perfectOn)
-				elseif sortMode == "Rarity" then
-					local ta, tb = tier_of(a:GetAttribute("Rarity")), tier_of(b:GetAttribute("Rarity"))
-					if ta ~= tb then return ta > tb end
-					return tree_value(a, S.perfectOn) > tree_value(b, S.perfectOn)
-				else
-					local sa, sb = top_score(a), top_score(b)
-					if sa ~= sb then return sa > sb end
-					return tree_odds(a) > tree_odds(b)
-				end
+				local ka, kb = rank_key(a), rank_key(b)
+				if ka ~= kb then return ka > kb end
+				-- *stable tiebreak: TreeId never changes, so equal ranks never swap*
+				return tree_sort_id(a) < tree_sort_id(b)
 			end)
+			list = apply_hysteresis(list)
+			-- *a transient read that yields nothing must not blank a populated table:
+			-- keep the previous list rather than flashing empty rows*
+			if #list > 0 then
+				lastGoodList = list
+			elseif lastGoodList and #lastGoodList > 0 then
+				list = lastGoodList
+			end
 			local want = visible_top_rows()
 			for i = 1, MAX_TOP_ROWS do
 				local row = rows[i]
 				if not row then break end
-				local t = list[i]
+				local st = rowState[i]
+				if not st then
+					st = {tree = nil, text = nil, visible = nil, disabled = nil}
+					rowState[i] = st
+				end
+				local t = i <= want and list[i] or nil
 				local show = i <= want
-				pcall(function() row.button:SetVisible(show) end)
-				if not show then
-					row.tree = nil
-				else
-					row.tree = t
-					if t then
-						local d
-						if myRoot and t:FindFirstChild("Trunk") then
-							d = math.floor((t.Trunk.Position - myRoot.Position).Magnitude)
-						end
-						pcall(function() row.button:SetText(top_wood_row_text(t, d)) end)
-						-- *a growing row would fail StartChop, so grey it out until it ripens*
-						pcall(function() row.button:SetDisabled(is_growing(t)) end)
-					else
-						pcall(function() row.button:SetText("—") end)
-						pcall(function() row.button:SetDisabled(true) end)
+				if st.visible ~= show then
+					pcall(function() row.button:SetVisible(show) end)
+					st.visible = show
+				end
+				row.tree = t
+				if t then
+					-- *distance rounded to 10 studs so walking doesn't churn the text*
+					local d
+					if myRoot and t:FindFirstChild("Trunk") then
+						d = math.floor((t.Trunk.Position - myRoot.Position).Magnitude / 10) * 10
 					end
+					local text = top_wood_row_text(t, d)
+					if st.text ~= text then
+						pcall(function() row.button:SetText(text) end)
+						st.text = text
+					end
+					-- *a growing row would fail StartChop, so grey it out until it ripens*
+					local dis = is_growing(t)
+					if st.disabled ~= dis then
+						pcall(function() row.button:SetDisabled(dis) end)
+						st.disabled = dis
+					end
+					st.tree = t
+				else
+					if st.text ~= "—" then
+						pcall(function() row.button:SetText("—") end)
+						st.text = "—"
+					end
+					if st.disabled ~= true then
+						pcall(function() row.button:SetDisabled(true) end)
+						st.disabled = true
+					end
+					st.tree = nil
 				end
 			end
 			if topLabel then
@@ -2313,8 +2393,12 @@ task.spawn(function()
 				local growing = 0
 				for _, t in ipairs(list) do if is_growing(t) then growing += 1 end end
 				local growTxt = growing > 0 and (" · %d growing"):format(growing) or ""
-				safe_set(topLabel, ("%d shown · %d live%s · %s · %.1fs"):format(
-					math.min(want, #list), #list, growTxt, mode, tonumber(S.refreshRate) or 1))
+				local txt = ("%d shown · %d live%s · %s · %.1fs"):format(
+					math.min(want, #list), #list, growTxt, mode, tonumber(S.refreshRate) or 1)
+				if lastTopLabelText ~= txt then
+					lastTopLabelText = txt
+					safe_set(topLabel, txt)
+				end
 			end
 		end
 		task.wait(math.clamp(tonumber(S.refreshRate) or 1, 0.25, 10))
