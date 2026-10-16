@@ -423,15 +423,66 @@ local function sell_value_of(tree)
 	return weight * mult
 end
 
--- Rarity odds: WoodConfig.Rarities carries Chance as a spawn fraction
--- (Common 0.5976, Legendary 0.009, Secret 0.0001), so the "1 in N" reading is
--- 1/chance — bigger N, rarer tree. The Top-wood ranking is odds-first; price
--- only breaks ties between trees of the same rarity.
-local function rarity_odds(tree)
-	local info = rarity_info(tree:GetAttribute("Rarity"))
-	local chance = tonumber(info and info.Chance) or 1
-	if chance <= 0 then chance = 1 end
+-- FINAL ODDS — straight from the game's own roll functions, no invented math:
+--   WoodConfig.RarityChance(biome, rarity)  biome-adjusted spawn fraction
+--     (verified live: BirchHills/Epic 0.06, RedwoodGrove/Epic 0.04)
+--   WoodConfig.ScaleChance(scale)           size-roll fraction
+--     (verified live: scale 1.0 -> 0.471, scale 2.0 -> 0.00061)
+--   WoodConfig.Mutations[i].Chance          per-mutation fraction
+--     (Sparkling 0.01 ... Prismatic 0.0002; MaxMutations = 1)
+-- A tree with a mutation is a tree that ALSO rolled that mutation, so the
+-- combined odds are the product of every roll it won. 1/N, bigger N = rarer.
+local function tree_odds(t)
+	local okC, chance = pcall(function()
+		return WoodConfig.RarityChance(t:GetAttribute("Biome"), t:GetAttribute("Rarity"))
+	end)
+	if not okC or type(chance) ~= "number" or chance <= 0 then
+		local info = rarity_info(t:GetAttribute("Rarity"))
+		chance = tonumber(info and info.Chance) or 1
+	end
+	local scale = tonumber(t:GetAttribute("Scale")) or 1
+	local okS, schance = pcall(function() return WoodConfig.ScaleChance(scale) end)
+	if okS and type(schance) == "number" and schance > 0 then
+		chance = chance * schance
+	end
+	local muts = t:GetAttribute("Mutations")
+	if type(muts) == "table" then
+		for _, idx in ipairs(muts) do
+			local m = tonumber(idx) and WoodConfig.Mutations[tonumber(idx)]
+			local mc = type(m) == "table" and tonumber(m.Chance)
+			if mc and mc > 0 then chance = chance * mc end
+		end
+	end
+	if chance <= 0 then chance = 1e-9 end
 	return 1 / chance
+end
+
+-- the merchant's price for this tree exactly as the value chain reads:
+-- weight x rarity multiplier x every mutation multiplier
+local function tree_price(t)
+	local info = rarity_info(t:GetAttribute("Rarity"))
+	local mult = info.ValueMultiplier or 1
+	local weight = tonumber(t:GetAttribute("Weight")) or 0
+	local mutMult = 1
+	local muts = t:GetAttribute("Mutations")
+	if type(muts) == "table" then
+		for _, idx in ipairs(muts) do
+			local m = tonumber(idx) and WoodConfig.Mutations[tonumber(idx)]
+			if type(m) == "table" and tonumber(m.ValueMultiplier) then
+				mutMult = mutMult * m.ValueMultiplier
+			end
+		end
+	end
+	return weight * mult * mutMult
+end
+
+-- the game's own size tier for this tree's scale (Normal/Big/Ancient/...)
+local function tree_size_label(t)
+	local scale = tonumber(t:GetAttribute("Scale"))
+	if not scale then return "" end
+	local okL, label = pcall(function() return WoodConfig.SizeAt(scale) end)
+	if okL and type(label) == "string" then return label end
+	return ""
 end
 
 local function is_live(tree)
@@ -2264,23 +2315,27 @@ refresh_ladder()
 -- anything else.
 local function top_wood_row_text(t, dist)
 	local wood = t:GetAttribute("Wood") or t.Name
-	local rarity = tostring(t:GetAttribute("Rarity") or "?")
-	local odds = math.floor(rarity_odds(t) + 0.5)
-	local oddsTxt = ("1/%s"):format(odds)
+	local odds = math.floor(tree_odds(t) + 0.5)
+	local size = tree_size_label(t)
 	local muts = t:GetAttribute("Mutations")
 	local mutTxt = ""
 	if type(muts) == "table" then
 		local names = {}
 		for _, idx in ipairs(muts) do
 			local mi = mutation_info(idx)
-			if mi then names[#names+1] = mi.Name:sub(1, 5) end
+			if mi then names[#names+1] = mi.Name end
 		end
 		if #names > 0 then mutTxt = "  " .. table.concat(names, "+") end
 	end
 	local state = tostring(t:GetAttribute("State") or "?")
 	local d = dist and ("  %dm"):format(dist) or ""
-	return ("%s  ·  %s %s  ·  %s%s  ·  %s%s"):format(
-		wood, oddsTxt, rarity, fmt_val(sell_value_of(t)), mutTxt, state, d)
+	-- Normal-size trees skip the size token — only a rolled-up tier is news
+	if size ~= "" and size ~= "Normal" then
+		return ("%s  ·  1/%s  ·  %s  ·  %s%s  ·  %s%s"):format(
+			wood, odds, size, fmt_val(tree_price(t)), mutTxt, state, d)
+	end
+	return ("%s  ·  1/%s  ·  %s%s  ·  %s%s"):format(
+		wood, odds, fmt_val(tree_price(t)), mutTxt, state, d)
 end
 
 task.spawn(function()
@@ -2298,12 +2353,12 @@ task.spawn(function()
 					list[#list+1] = t
 				end
 			end
-			-- odds-first: 1/chance is the rarity the game actually rolls with
-			-- (Secret 1/10000 tops any price), price breaks same-rarity ties
+			-- final-rarity ranking: combined odds (rarity x size x mutations)
+			-- first, the tree's real price breaks ties between equals
 			table.sort(list, function(a, b)
-				local oa, ob = rarity_odds(a), rarity_odds(b)
+				local oa, ob = tree_odds(a), tree_odds(b)
 				if oa ~= ob then return oa > ob end
-				return sell_value_of(a) > sell_value_of(b)
+				return tree_price(a) > tree_price(b)
 			end)
 			for i = 1, 6 do
 				local row = rows[i]
