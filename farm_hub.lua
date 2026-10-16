@@ -1618,14 +1618,14 @@ end)
 -- least six seconds, i.e. Airflow does not re-centre afterwards. It retries
 -- because the Frame takes a moment to appear even at this point.
 task.spawn(function()
-	for i = 1, 40 do
-		local applied = false
+	-- No early break. The loop used to stop at the first pass that measured
+	-- absY=6, which happened before the tabs finished building; Airflow's own
+	-- layout pass then re-centred the window and the clamp was gone. Reapply
+	-- through the whole build window instead.
+	for _ = 1, 40 do
 		pcall(function()
-			local main
-			for _, ch in ipairs(Window.Gui:GetChildren()) do
-				if ch:IsA("Frame") then main = ch break end
-			end
-			if not main then return end
+			local main = Window.Gui:FindFirstChild("Window")
+			if not (main and main:IsA("Frame")) then return end
 			local vp = workspace.CurrentCamera.ViewportSize
 			if main.AbsoluteSize.Y > vp.Y - 16 then
 				local k = (vp.Y - 16) / main.AbsoluteSize.Y
@@ -1639,10 +1639,8 @@ task.spawn(function()
 				main.Position.X.Offset + (wantLeft - curAbsX),
 				main.Position.Y.Scale,
 				main.Position.Y.Offset + (6 - curAbsY))
-			applied = (math.abs(main.AbsolutePosition.Y - 6) < 2)
 		end)
-		if applied then break end
-		task.wait(0.25)
+		task.wait(0.3)
 	end
 end)
 
