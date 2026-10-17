@@ -1367,15 +1367,37 @@ local function teleport_to(pos, offset)
 	return true
 end
 
+-- *Midnight base with the Blizzard cyan accent, matching the FortuneFighter hub:
+-- same palette, same logo asset, same snow backdrop. Palette lives on the root
+-- library, not the window — Window has no SetTheme.*
+local BLIZZARD_SCHEME = {
+	Background = Color3.fromRGB(15, 18, 26),
+	Surface = Color3.fromRGB(18, 22, 31),
+	Surface2 = Color3.fromRGB(22, 26, 37),
+	Surface3 = Color3.fromRGB(37, 44, 60),
+	Stroke = Color3.fromRGB(34, 40, 55),
+	StrokeHover = Color3.fromRGB(58, 92, 104),
+	Accent = Color3.fromRGB(100, 205, 215),
+	AccentDark = Color3.fromRGB(14, 18, 30),
+	Text = Color3.fromRGB(228, 232, 242),
+	Muted = Color3.fromRGB(116, 126, 148),
+	Warning = Color3.fromRGB(240, 176, 108),
+	Success = Color3.fromRGB(150, 220, 170),
+	Error = Color3.fromRGB(240, 120, 120),
+}
+pcall(function() Airflow:SetTheme(BLIZZARD_SCHEME) end)
+pcall(function() Airflow:SetDefaultTheme(BLIZZARD_SCHEME) end)
+
 local Window = Airflow:CreateWindow({
-	Name = "Blizzard",
+	Name = "Blizzard Hub",
 	LoadingSubtitle = "Foresters",
-	Icon = "trees",
+	Icon = "rbxassetid://74093118428711",
 	ToggleUIKeybind = "RightShift",
+	Backdrop = {Weather = "Snow", Tint = 0.45},
 	AdaptiveSize = false,
-	UIScale = 1.2,
+	UIScale = 1,
 	Density = "Default",
-	Size = UDim2.fromOffset(585, 290),
+	Size = UDim2.fromOffset(700, 430),
 	ConfigurationSaving = {Enabled = true, FolderName = "ForestersHub"},
 })
 S.window = Window
@@ -1389,11 +1411,13 @@ local settingsTab = Window:CreateTab({Name = "Settings", Icon = "settings"})
 local gbConfig = settingsTab:CreateGroupbox({Name = "Configs", Side = "Left"})
 local gbTheme = settingsTab:CreateGroupbox({Name = "Theme", Side = "Right"})
 
+-- *balanced columns: five groupboxes used to stack down the left and the right
+-- column sat nearly empty, which is what made the window look lopsided*
 local gbTop = farmTab:CreateGroupbox({Name = "Top wood", Side = "Left"})
 local gbFarm = farmTab:CreateGroupbox({Name = "Farming", Side = "Left"})
-local gbQuest = farmTab:CreateGroupbox({Name = "Quests", Side = "Left"})
 local gbSession = farmTab:CreateGroupbox({Name = "Session", Side = "Right"})
 local gbServer = farmTab:CreateGroupbox({Name = "Server", Side = "Right"})
+local gbQuest = farmTab:CreateGroupbox({Name = "Quests", Side = "Right"})
 
 local gbAxes = axeTab:CreateGroupbox({Name = "Shop", Side = "Left"})
 local gbLadder = axeTab:CreateGroupbox({Name = "Buy ladder", Side = "Right"})
