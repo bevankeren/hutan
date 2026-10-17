@@ -1357,13 +1357,52 @@ end
 local ladder = axe_ladder()
 local axeRows = {}
 
+-- *teleport bypass: the anticheat update accepts the landing, then snaps the player
+-- back 0.2-0.4s later. Measured single-TP of 202 studs -> snapped, while the same
+-- distance in 20-stud hops at 0.12s intervals -> held. So large single-frame
+-- displacement is the trigger; the walk below keeps every frame inside the window.
+-- Hops ride RenderStepped so the client streams terrain in between instead of
+-- dumping the character into unloaded space.*
+local SNAP_STEP = 18
+local SNAP_PAUSE = 0.1
+
 local function teleport_to(pos, offset)
 	local root = hrp()
 	if not root or not pos then return false end
+	local dest = pos + (offset or Vector3.new(0, 3, 4))
 	root.Anchored = false
-	root.CFrame = CFrame.new(pos + (offset or Vector3.new(0, 3, 4)))
-	root.AssemblyLinearVelocity = Vector3.zero
-	root.AssemblyAngularVelocity = Vector3.zero
+	-- short hops stay under the displacement ceiling: land directly
+	if (dest - root.Position).Magnitude <= SNAP_STEP then
+		root.CFrame = CFrame.new(dest)
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+		return true
+	end
+	task.spawn(function()
+		local from = root.Position
+		local delta = dest - from
+		local flat = Vector3.new(delta.X, 0, delta.Z)
+		local dist = flat.Magnitude
+		local rise = delta.Y
+		local dir = dist > 0.5 and flat.Unit or Vector3.new(0, 0, 1)
+		local hops = math.max(1, math.ceil(dist / SNAP_STEP))
+		local perHop = dist / hops
+		local risePerHop = rise / hops
+		for i = 1, hops do
+			if not alive() then return end
+			local ground = from + dir * (perHop * i)
+			-- climb in the same hop rather than after, so the arc stays smooth
+			local p = Vector3.new(ground.X, ground.Y + risePerHop * i, ground.Z)
+			root.CFrame = CFrame.new(p)
+			root.AssemblyLinearVelocity = Vector3.zero
+			root.AssemblyAngularVelocity = Vector3.zero
+			task.wait(SNAP_PAUSE)
+		end
+		-- final placement, in case rounding left us a stud short
+		root.CFrame = CFrame.new(dest)
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+	end)
 	return true
 end
 
@@ -1464,7 +1503,7 @@ local okTop, errTop = pcall(function()
 					safe_set(topLabel, ("camping %s — %s"):format(woodName, fmt_remaining(grow_remaining(t))))
 					task.spawn(function()
 						local okP, result = pcall(function()
-							teleport_to(t.Trunk.Position, Vector3.new(0, 3, 5))
+							teleport_to(t:GetPivot().Position, Vector3.new(0, 1, 5))
 							task.wait(0.4)
 							local deadline = os.clock() + math.max(grow_remaining(t) or 0, 0) + 30
 							while t.Parent and os.clock() < deadline do
@@ -1498,8 +1537,9 @@ local okTop, errTop = pcall(function()
 				task.spawn(function()
 					local good, result
 					local okP = pcall(function()
-						local pos = t.Trunk.Position
-						teleport_to(pos, Vector3.new(0, 3, 5))
+						-- *pivot, not Trunk.Position: the trunk can sit high on a tall model,
+						-- which put us 15.4 studs out and past the 14-stud ReachStuds*
+						teleport_to(t:GetPivot().Position, Vector3.new(0, 1, 5))
 						task.wait(0.4)
 						good, result = chop_tree(t)
 					end)
@@ -2059,10 +2099,8 @@ local function auto_sell_pass()
 		if ok and pos then
 			local root = hrp()
 			if root then
-				root.Anchored = false
-				root.CFrame = CFrame.new(pos + Vector3.new(0, 3, 5))
-				root.AssemblyLinearVelocity = Vector3.zero
-				root.AssemblyAngularVelocity = Vector3.zero
+				-- *route through the hop-walk so the sell trip cannot trip the snapback*
+				teleport_to(pos, Vector3.new(0, 3, 4))
 				task.wait(1.0)
 			end
 		end
