@@ -192,13 +192,13 @@ S.logCount = S.logCount or 0
 if S.hideIngameName == nil then S.hideIngameName = true end
 S.esp = S.esp or {}
 if type(S.minTier) ~= "number" then S.minTier = 0 end
-S.refreshRate = tonumber(S.refreshRate) or 1
+S.refreshRate = tonumber(S.refreshRate) or 10
 S.topSort = type(S.topSort) == "string" and S.topSort or "Money"
 S.minValue = tonumber(S.minValue) or 0
 S.maxRows = tonumber(S.maxRows) or 8
 S.weightValue = type(S.weightValue) == "number" and S.weightValue or 0.6
 S.includeGrowing = S.includeGrowing == true
-S.sameIslandOnly = S.sameIslandOnly ~= false
+S.sameIslandOnly = S.sameIslandOnly == true
 S.moveMode = (S.moveMode == "bike") and "bike" or "respawn"
 S.respawnDelay = 0.15
 do
@@ -2203,7 +2203,7 @@ local Window = Airflow:CreateWindow({
 	LoadingSubtitle = "Foresters",
 	Icon = "rbxassetid://74093118428711",
 	ToggleUIKeybind = "RightShift",
-	Backdrop = {Weather = "Snow", Tint = 0.45},
+	Backdrop = {Weather = "None", Tint = 0.45},
 	AdaptiveSize = false,
 	UIScale = 1,
 	Density = "Default",
@@ -2818,7 +2818,7 @@ gbFarm:CreateSlider({
 	Name = "Refresh every",
 	Range = {1, 20},
 	Increment = 1,
-	CurrentValue = S.refreshRate or 1,
+	CurrentValue = S.refreshRate or 10,
 	Suffix = "s",
 	Flag = "RefreshRate",
 	Callback = function(n) S.refreshRate = n end,
@@ -2839,7 +2839,7 @@ gbFarm:CreateToggle({
 gbFarm:CreateToggle({
 	Name = "Same island only",
 	Flag = "SameIslandOnly",
-	CurrentValue = S.sameIslandOnly ~= false,
+	CurrentValue = S.sameIslandOnly == true,
 	Callback = function(on)
 		S.sameIslandOnly = on
 		if topLabel then
@@ -3331,14 +3331,14 @@ task.spawn(function()
 				for _, t in ipairs(list) do if is_growing(t) then growing += 1 end end
 				local growTxt = growing > 0 and (" · %d growing"):format(growing) or ""
 				local txt = ("%d shown · %d live%s · %s · %.1fs"):format(
-					math.min(want, #list), #list, growTxt, mode, tonumber(S.refreshRate) or 1)
+					math.min(want, #list), #list, growTxt, mode, tonumber(S.refreshRate) or 10)
 				if lastTopLabelText ~= txt then
 					lastTopLabelText = txt
 					safe_set(topLabel, txt)
 				end
 			end
 		end
-		task.wait(math.clamp(tonumber(S.refreshRate) or 1, 0.25, 20))
+		task.wait(math.clamp(tonumber(S.refreshRate) or 10, 0.25, 20))
 	end
 end)
 
