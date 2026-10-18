@@ -96,6 +96,47 @@ at `Y=45` — a path the terrain solver got wrong, and the status line sat on
 The lesson: a pathfinder gets stuck and self-heals. A CFrame teleport either holds or
 kills the client. The pathfinder's failure mode is survivable; ours was not.
 
+### The ocean floor is walkable — this is the big one
+
+We assumed crossing islands meant crossing open water. It does not. Raycast straight
+down along the line from Oak Island `(-88, 30, -565)` to Dusty Mesa `(-626, 30, 341)`:
+
+```
+f=0.00 Y=24  UniqueShape1     <- Oak shore
+f=0.05 Y=22  GrassTopPart
+f=0.10 Y=7   Rock2
+f=0.15 Y=2   Part
+f=0.20 Y=0   Terrain          <- seabed begins
+f=0.25 Y=0   Terrain
+f=0.30 Y=0   Terrain
+f=0.35 Y=0   Terrain
+f=0.40 Y=0   Terrain
+f=0.45 Y=0   Terrain
+f=0.50 Y=0   Terrain          <- halfway across
+f=0.55 Y=0   Terrain
+f=0.60 Y=0   Terrain
+f=0.65 Y=0   Terrain
+f=0.70 Y=0   Terrain
+f=0.75 Y=0   Terrain
+f=0.80 Y=22  UniqueShape1     <- Dusty Mesa shore
+f=0.85 Y=32  GrassTopPart
+f=0.90 Y=41  Root
+f=0.95 Y=135 RockPart
+f=1.00 Y=24  Rock2
+```
+
+There is a continuous `Terrain` floor at `Y=0` under the entire crossing. Every island
+sits in the same seabed. `PathfindingService` can therefore produce a legal walking
+path between any two islands, and `Humanoid:MoveTo` will follow it — through the water,
+on foot, at 22 studs/s, with the server's full blessing.
+
+That is the actual answer to "how do they cross islands". Not teleport. Not a bypass.
+**The map has a walkable floor and they use it.**
+
+Confirmed: caught their character standing on Dusty Mesa
+(`pos=-743,49,350`) with the walker still active and no displacement event.
+
+
 
 ---
 
@@ -137,12 +178,14 @@ The minigame itself:
 
 | Insight | Action for our hub |
 |---|---|
+| **Seabed at Y=0 connects all islands** | Walk cross-island via `PathfindingService`; do not teleport over water |
 | Real walking is unflaggable | Replace `teleport_to` CFrame writes with `Humanoid:MoveTo` + `CanCollide=false` |
 | 125-stud teleport threshold | Only teleport past a distance the walker can't cover cheaply |
 | Root-only anchor works, all-parts doesn't | Keep as documented fallback, never anchor every part |
 | `ChopStrike` carries `(tree, elapsed, openedAt)` | Already emitted by the real minigame — don't fabricate it |
 | `Strip Map (Walk)` exists | Long trips need the map stripped or VRAM dies on 2 GB cards |
 | Dangling sessions raise infractions | Always cancel |
+| Pathfinder self-heals from stuck | Retry/recompute beats aborting on a failed hop |
 
 ---
 
