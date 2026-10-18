@@ -361,3 +361,59 @@ Catatan lingkungan:
 - Konektor HP: `getgenv().BridgeURL`, lalu `HttpGet .../script.luau`
 - Reset `getgenv().MCP_Loaded = nil` sebelum menyambung ulang
 - GUI hub: `CoreGui.RobloxGui["Blizzard Hub"]`
+
+---
+
+## 2026-10-18 17:17:23 +07:00 — bike TP: celah ditemukan, thrust ekstrem masih gagal
+
+Game  : Foresters 🌳 [RELEASE]
+Place : 117020342702668
+Client: 0.743.0.7431134
+Job   : 7a6319da-4785-44a7-9556-5da63e8ff7df
+
+### Perubahan
+- Investigasi metode TP baru lewat bike (ide Captain).
+- Tidak ada kode hub yang diubah.
+
+### Alasan
+- Captain ingin TP yang diterima server, memanfaatkan animasi naik bike.
+
+### Bukti — yang berhasil
+- `BikeConfig` ada; `MountainBike`: MaxSpeed 28, Accel 18, WheelRadius 1.38,
+  SpawnCooldown 3, IdleSeconds 60.
+- `BikeService` punya `Spawn`, `Ride`, `PutAway`.
+- `BikeService:Spawn()` (tanpa argumen) yang benar-benar memunculkan model;
+  `Spawn("MountainBike")` juga mengembalikan true tapi tidak selalu menghasilkan
+  model baru, jadi hasilnya harus diverifikasi lewat set difference pada
+  `workspace.Bikes`, bukan dari nilai return.
+- Bike muncul di `Workspace.Bikes` dengan nama `<NamaPlayer>Bike`, punya atribut
+  `Owner`, `BikeId`, `Token`, `Ridden`.
+- `seat:Sit(hum)` berhasil: `seat.Occupant == hum`, `Humanoid.Sit == true`,
+  karakter menempel 2 stud dari chassis.
+- **PivotTo pada bike saat dinaiki DITOLAK** — bike balik ke posisi semula
+  dalam 0,2 detik, karakter tetap di tempat. Server memegang otoritas.
+- **AssemblyLinearVelocity pada chassis BERHASIL** — satu impuls 900 stud/s
+  membuat bike + penunggang bergerak bersama: jarak ke target 86 → 69 stud,
+  `stillSeated = true`, `gapToBike = 2`. Ini jalur yang hidup.
+
+### Bukti — yang gagal
+- Thrust berkelanjutan 1200 stud/s selama 0,6 detik → koneksi putus.
+- Log: `Disconnected from server for reason: Player: 285
+  (DisconnectClientInitiated)` — **kode yang sama** dengan disconnect yang sudah
+  dilacak di SOAK_TEST_LOG.md, bukan `Banned`, bukan pesan kick.
+- Belum bisa dipastikan apakah thrust-nya penyebab, karena 285 juga muncul tanpa
+  aktivitas apa pun sebelumnya. Perlu tes ulang dengan thrust lebih kecil.
+
+### Kesimpulan
+- Celah bike itu **nyata**: penunggang ikut saat chassis digerakkan dengan
+  kecepatan, tanpa snapback.
+- Masalahnya cuma besaran. 900 stud/s sesaat = bergerak. 1200 stud/s selama 0,6
+  detik = putus.
+- Langkah berikutnya: cari besaran aman. Mulai dari impuls tunggal ~200–400
+  stud/s, berulang tiap frame hanya bila perlu, dan hentikan thrust begitu
+  jarak < 10 stud.
+
+### Catatan
+- Jangan pakai `PivotTo` untuk bike; server menolaknya.
+- Jangan simpan referensi model bike — model diganti/dihapus saat respawn.
+  Cari ulang lewat set difference pada `workspace.Bikes`.
