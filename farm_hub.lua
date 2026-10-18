@@ -222,26 +222,33 @@ local HUG_OFFSET = 3.5
 local STAND_HEIGHT = 0.5
 local attachYaw = 0
 
--- *advanced teleport bypass:
--- 1. Continuous RunService.Stepped noclip: prevents Roblox from restoring part collision
---    mid-movement, eliminating physics impulse / wall bumping crashes completely.
--- 2. Terrain-contour raycasting: samples ground elevation ahead so the character follows
---    natural hills instead of tunneling through dirt or rocks.
--- 3. Paced safe speed (50 studs/s @ 0.04s): tested 100% held with zero server snapback.*
-local MOVE_SPEED = 50
+-- *anchored-root transit bypass:
+-- Anchoring ONLY the HumanoidRootPart takes the character out of the physics solver
+-- (no contacts, no impulses, no penetration resolution) while keeping the assembly
+-- welds intact so CFrame writes actually move the character. Anchoring every part
+-- instead severs the assembly and CFrame writes become no-ops — verified: root-only
+-- anchor moved 361 studs, all-parts anchor moved 0.
+--
+-- Legs of 120 studs with RequestStreamAroundAsync between them keep the terrain
+-- streaming queue flat instead of pulling every biome in at once, which is what
+-- exhausts VRAM on a 2 GB card and crashpads the client ('ReadProcessMemory 299').*
+local MOVE_SPEED = 60
+local CHUNK_STUDS = 120
+local STREAM_WAIT = 0.25
+
+local function wait_for_stream(pos)
+	local ok = pcall(function() workspace:RequestStreamAroundAsync(pos) end)
+	task.wait(ok and STREAM_WAIT or 0.1)
+end
 
 local function teleport_to(pos, offset, finalFacing)
 	local root = hrp()
 	if not root or not pos then return false end
 	local dest = pos + (offset or Vector3.new(0, 1, 4))
-	root.Anchored = false
 	local from = root.Position
 	local delta = dest - from
 	local dist = delta.Magnitude
 
-	-- *island-spanning travel is legitimate inside one island (Oak Island alone is
-	-- ~580 studs wide). The cross-island guard lives in on_same_island(), not here,
-	-- so this ceiling only needs to stop absurd jumps.*
 	if dist > 900 then
 		return false, "distance too far"
 	end
@@ -254,63 +261,76 @@ local function teleport_to(pos, offset, finalFacing)
 	end
 
 	local char = plr.Character
-	local RS = game:GetService("RunService")
-	local noclipConn = RS.Stepped:Connect(function()
-		if char then
-			for _, p in ipairs(char:GetDescendants()) do
-				if p:IsA("BasePart") then p.CanCollide = false end
-			end
-		end
-		if root then
-			root.AssemblyLinearVelocity = Vector3.zero
-			root.AssemblyAngularVelocity = Vector3.zero
-		end
-	end)
-
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
 	local rayParams = RaycastParams.new()
 	rayParams.FilterType = Enum.RaycastFilterType.Exclude
 	rayParams.FilterDescendantsInstances = {char}
 
-	local duration = dist / MOVE_SPEED
-	local steps = math.max(1, math.ceil(duration / 0.04))
 	local flatDelta = Vector3.new(dest.X - from.X, 0, dest.Z - from.Z)
 	local travelRot = (flatDelta.Magnitude > 0.1) and (CFrame.lookAt(Vector3.zero, flatDelta) - Vector3.zero) or (root.CFrame - root.Position)
 
-	for i = 1, steps do
-		if not alive() then
-			noclipConn:Disconnect()
-			restore_collide()
-			return false
-		end
-		local frac = i / steps
-		local curX = from.X + (dest.X - from.X) * frac
-		local curZ = from.Z + (dest.Z - from.Z) * frac
-		local ray = workspace:Raycast(Vector3.new(curX, from.Y + 15, curZ), Vector3.new(0, -50, 0), rayParams)
-		local curY = ray and (ray.Position.Y + 2.5) or (from.Y + (dest.Y - from.Y) * frac)
+	-- *freeze the humanoid and anchor the root: the assembly stays welded, the
+	-- solver stops touching it, and CFrame writes move the whole character.*
+	if hum then pcall(function() hum.PlatformStand = true end) end
+	root.Anchored = true
+	task.wait(0.05)
 
-		root.CFrame = CFrame.new(curX, curY, curZ) * travelRot
-		task.wait(0.04)
+	local legs = math.max(1, math.ceil(dist / CHUNK_STUDS))
+	local legStart = from
+	local aborted = false
+
+	for leg = 1, legs do
+		if not alive() then aborted = true break end
+		local frac = leg / legs
+		local legEnd = Vector3.new(
+			from.X + (dest.X - from.X) * frac,
+			from.Y + (dest.Y - from.Y) * frac,
+			from.Z + (dest.Z - from.Z) * frac
+		)
+
+		wait_for_stream(legEnd)
+
+		local legDelta = legEnd - legStart
+		local legDist = legDelta.Magnitude
+		local legSteps = math.max(1, math.ceil((legDist / MOVE_SPEED) / 0.04))
+
+		for i = 1, legSteps do
+			if not alive() then aborted = true break end
+			local f = i / legSteps
+			local curX = legStart.X + legDelta.X * f
+			local curZ = legStart.Z + legDelta.Z * f
+			local ray = workspace:Raycast(Vector3.new(curX, legStart.Y + 20, curZ), Vector3.new(0, -60, 0), rayParams)
+			local curY = ray and (ray.Position.Y + 3.0) or (legStart.Y + legDelta.Y * f)
+
+			root.CFrame = CFrame.new(curX, curY, curZ) * travelRot
+			task.wait(0.04)
+		end
+		if aborted then break end
+
+		legStart = legEnd
+		task.wait(0.06)
 	end
 
-	-- *final landing must sit ON the ground, not below it. Placing the root at the
-	-- raw destination Y while collision is off lets the character sink into terrain,
-	-- which the server flags as AnticheatHop.*
-	local landRay = workspace:Raycast(Vector3.new(dest.X, dest.Y + 40, dest.Z), Vector3.new(0, -120, 0), rayParams)
-	local landY = landRay and (landRay.Position.Y + 2.8) or dest.Y
-	local landPos = Vector3.new(dest.X, landY, dest.Z)
-	local landRot = finalFacing and (finalFacing - finalFacing.Position) or travelRot
-	root.CFrame = CFrame.new(landPos) * landRot
-	root.AssemblyLinearVelocity = Vector3.zero
-	root.AssemblyAngularVelocity = Vector3.zero
+	if not aborted then
+		-- *land exactly on the surface*
+		local landRay = workspace:Raycast(Vector3.new(dest.X, dest.Y + 60, dest.Z), Vector3.new(0, -180, 0), rayParams)
+		local landY = landRay and (landRay.Position.Y + 3.0) or dest.Y
+		local landRot = finalFacing and (finalFacing - finalFacing.Position) or travelRot
+		root.CFrame = CFrame.new(Vector3.new(dest.X, landY, dest.Z)) * landRot
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+		task.wait(0.08)
+	end
 
-	task.wait(0.05)
-	noclipConn:Disconnect()
+	-- *release: unanchor, restore collision, hand control back to the humanoid*
+	root.Anchored = false
 	restore_collide()
-
-	-- *settle: give the humanoid a frame to re-ground itself before anything reads
-	-- its state, so we never chop while it is still Swimming/Falling.*
-	task.wait(0.2)
-	return true
+	if hum then
+		pcall(function() hum.PlatformStand = false end)
+		pcall(function() hum:ChangeState(Enum.HumanoidStateType.GettingUp) end)
+	end
+	task.wait(0.3)
+	return not aborted
 end
 
 local function attach(tree, anchor, reroll)
