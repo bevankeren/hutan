@@ -3067,7 +3067,7 @@ local function init_leveling_module()
 
 	local felledCount = 0
 	local startTime = 0
-	local levelSpeed = 28
+	local levelSpeed = 24
 	local autoLevelingToggle = nil
 	local unreachable = {}
 	local currentAbortFlag = false
@@ -3256,7 +3256,7 @@ local function init_leveling_module()
 		local hum = char and char:FindFirstChildOfClass("Humanoid")
 		if not (root and hum) then return false, "no character" end
 
-		speed = speed or levelSpeed or 28
+		speed = math.clamp(tonumber(speed or levelSpeed or 24) or 24, 16, 24)
 		stopDist = stopDist or 2.8
 		hum.WalkSpeed = speed
 		hum.AutoRotate = true
@@ -3378,15 +3378,13 @@ local function init_leveling_module()
 					hum:MoveTo(root.Position + sideVec)
 					pcall(function() hum.Jump = true end)
 					task.wait(0.12)
-				elseif stallCount >= 10 and stallCount <= 14 then
-					-- Micro-noclip burst: smoothly step through thin posts/railings
-					noclipOn = true
+				elseif stallCount >= 10 and stallCount <= 13 then
+					-- Reverse step & jump to unpin from obstacle collision without noclip
+					local bwd = -root.CFrame.LookVector * 4.0
+					hum:MoveTo(root.Position + bwd)
 					pcall(function() hum.Jump = true end)
-					hum:MoveTo(targetWp.Position)
 					task.wait(0.15)
-					noclipOn = false
-					restore_collide()
-				elseif stallCount == 15 then
+				elseif stallCount == 14 then
 					local ok, newPath = pcall(function()
 						local p = pf:CreatePath({
 							AgentRadius = 3.2,
@@ -3742,14 +3740,12 @@ local function init_leveling_module()
 								pcall(function() hum.Jump = true end)
 								local sideVec = Vector3.new(-myRoot.CFrame.LookVector.Z, 0, root and root.CFrame.LookVector.X or 1) * 4.5
 								hum:MoveTo(curPos + sideVec)
-							-- Tier 2 (7s stuck): Micro-noclip impulse forward
+							-- Tier 2 (7s stuck): Diagonal back-step & jump to dislodge without noclip
 							elseif stuckSecs == 7 then
-								noclipOn = true
+								local bwdDiag = (-myRoot.CFrame.LookVector * 4.5) + (Vector3.new(-myRoot.CFrame.LookVector.Z, 0, myRoot.CFrame.LookVector.X) * 3.5)
+								hum:MoveTo(curPos + bwdDiag)
 								pcall(function() hum.Jump = true end)
-								hum:MoveTo(curPos + myRoot.CFrame.LookVector * 5.0)
 								task.wait(0.2)
-								noclipOn = false
-								restore_collide()
 							-- Tier 3 (14s stuck): Force abort current path & switch target
 							elseif stuckSecs == 14 then
 								currentAbortFlag = true
@@ -3805,11 +3801,11 @@ local function init_leveling_module()
 	gbLevelControls:CreateSlider({
 		Name = "Walk Speed",
 		Flag = "LevelingWalkSpeed",
-		Range = {16, 32},
+		Range = {16, 24},
 		Increment = 1,
-		CurrentValue = 28,
+		CurrentValue = 24,
 		Callback = function(val)
-			levelSpeed = tonumber(val) or 28
+			levelSpeed = math.clamp(tonumber(val) or 24, 16, 24)
 		end,
 	})
 
