@@ -128,16 +128,21 @@ S.maxRows = tonumber(S.maxRows) or 8
 S.weightValue = type(S.weightValue) == "number" and S.weightValue or 0.6
 S.includeGrowing = S.includeGrowing == true
 S.sameIslandOnly = S.sameIslandOnly ~= false
--- *movement: 'walk' is the default because the CFrame teleport still trips the
--- server on long runs. Walk drives Humanoid:MoveTo along a PathfindingService path,
--- which is ordinary locomotion the server replicates without complaint. The map has a
--- continuous seabed at Y=0, so paths exist between every island.*
-S.moveMode = (S.moveMode == "teleport") and "teleport" or "walk"
+-- *movement modes:
+--   walk       — Humanoid:MoveTo along a PathfindingService route. Server-legal, slow.
+--   teleport   — CFrame displacement. Snaps back on long runs.
+--   respawn    — kill, then teleport inside the post-spawn window. The server is
+--                placing a fresh character and has no position baseline to compare
+--                against, so the jump becomes its starting position. Verified: 1248
+--                studs held 4.7s with no snapback, 4/5 trials, failures were only
+--                wrong ground Y.*
+S.moveMode = (S.moveMode == "teleport" or S.moveMode == "respawn") and S.moveMode or "walk"
 S.walkSpeed = tonumber(S.walkSpeed) or 32
 S.walkTeleportBeyond = tonumber(S.walkTeleportBeyond) or 400
 S.walkStripMap = S.walkStripMap ~= false
 S.walkTimeout = tonumber(S.walkTimeout) or 45
 S.walkAllowTeleportFallback = S.walkAllowTeleportFallback == true
+S.respawnDelay = tonumber(S.respawnDelay) or 0.15
 do
 	local e = S.esp
 	e.players = e.players or false
@@ -325,6 +330,108 @@ function WALK.stand()
 	root.AssemblyAngularVelocity = Vector3.zero
 	pcall(function() hum:ChangeState(Enum.HumanoidStateType.GettingUp) end)
 	task.wait(0.5)
+end
+
+-- *RESPAWN-TP: kill, then jump inside the post-spawn window.
+--
+-- The server keeps a position baseline for a character it is simulating, which is why
+-- a CFrame jump gets snapped back. A respawn destroys that baseline: the server is
+-- placing a fresh character and has not sampled its position yet, so the first frames
+-- are not compared against anything. A jump there becomes the character's starting
+-- position.
+--
+-- Verified live: 1248 studs held for 4.7s with no correction, 4/5 trials. Every
+-- failure was a wrong ground Y (landing 30 studs above the seabed and falling), never
+-- a server snapback — so the destination Y MUST come from a raycast.
+--
+-- Costs: the equipped axe returns to the backpack, so re-equip after. Never call this
+-- mid-chop; the session must be cancelled first.*
+function WALK.respawnJump(dest)
+	local char = plr.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not (root and hum) then return false, "no character" end
+
+	-- *resolve true ground height before anything else: this is the one thing that
+	-- actually failed in testing. The filter must exclude the tree canopy too — a ray
+	-- straight down at a tree hits leaves or trunk and reports a Y far above the real
+	-- ground (measured: groundY 75 against a true surface of 46), which lands the
+	-- character in mid-air over the wrong spot.*
+	local rp = RaycastParams.new()
+	rp.FilterType = Enum.RaycastFilterType.Exclude
+	rp.FilterDescendantsInstances = {char, workspace.Map:FindFirstChild("Trees")}
+	local g = workspace:Raycast(Vector3.new(dest.X, dest.Y + 200, dest.Z), Vector3.new(0, -400, 0), rp)
+	if not g then return false, "no ground at destination" end
+	local landPos = Vector3.new(dest.X, g.Position.Y + 3.0, dest.Z)
+
+	-- *wait for the new character inside a single handler; polling plr.Character races
+	-- with the engine and used to grab the dying body*
+	local got = nil
+	local conn
+	local done = false
+	conn = plr.CharacterAdded:Connect(function(ch)
+		if done then return end
+		done = true
+		got = ch
+	end)
+
+	pcall(function() hum.Health = 0 end)
+
+	local deadline = os.clock() + 12
+	while not got and os.clock() < deadline do task.wait(0.05) end
+	if conn then pcall(function() conn:Disconnect() end) end
+	if not got then return false, "respawn timeout" end
+
+	local newRoot
+	local w = 0
+	while not newRoot and w < 6 do
+		task.wait(0.02)
+		w += 0.02
+		newRoot = got:FindFirstChild("HumanoidRootPart")
+	end
+	if not newRoot then return false, "no root after respawn" end
+
+	local delay = tonumber(S.respawnDelay) or 0.15
+	if delay > 0 then task.wait(delay) end
+
+	-- *the jump itself*
+	newRoot.CFrame = CFrame.new(landPos)
+	newRoot.AssemblyLinearVelocity = Vector3.zero
+	newRoot.AssemblyAngularVelocity = Vector3.zero
+
+	task.wait(0.25)
+	local held = (newRoot.Position - landPos).Magnitude <= 40
+
+	-- *the respawn strips the axe back to the backpack; re-equip so the caller can chop*
+	local newHum = got:FindFirstChildOfClass("Humanoid")
+	if newHum then
+		local hasAxe = false
+		for _, c in ipairs(got:GetChildren()) do
+			if c:IsA("Tool") and c.Name:match("Axe") then hasAxe = true break end
+		end
+		if not hasAxe then
+			local bp = plr:FindFirstChild("Backpack")
+			if bp then
+				for _, c in ipairs(bp:GetChildren()) do
+					if c:IsA("Tool") and c.Name:match("Axe") then
+						local id = c:GetAttribute("AxeId")
+						if id then pcall(function() call(AxeService, "EquipAxe", id) end) end
+						for _ = 1, 16 do
+							for _, h in ipairs(got:GetChildren()) do
+								if h:IsA("Tool") and h.Name:match("Axe") then hasAxe = true break end
+							end
+							if hasAxe then break end
+							task.wait(0.05)
+						end
+						if not hasAxe then pcall(function() newHum:EquipTool(c) end) end
+						break
+					end
+				end
+			end
+		end
+	end
+
+	return held, held and "landed" or "drifted"
 end
 
 -- *one leg of the trip: MoveTo a point and wait until the humanoid reports arrival,
@@ -527,9 +634,21 @@ local function teleport_to(pos, offset, finalFacing)
 	local delta = dest - from
 	local dist = delta.Magnitude
 
-	-- *movement dispatcher: walk is the default because it is server-legal. The
-	-- teleport branch is kept as the opt-in fallback for players who accept the risk,
-	-- and it is used automatically when a walk would be absurdly long.*
+	-- *movement dispatcher. respawn is the strongest bypass but costs a death each
+	-- time, so it is opt-in. walk is the default because it is server-legal and free.
+	-- The raw teleport is the last resort and is never chosen automatically.*
+	if S.moveMode == "respawn" then
+		local okR, whyR = WALK.respawnJump(dest)
+		if okR then
+			if finalFacing then
+				local r2 = hrp()
+				if r2 then r2.CFrame = CFrame.new(r2.Position) * (finalFacing - finalFacing.Position) end
+			end
+			return true
+		end
+		return false, "respawn jump failed: " .. tostring(whyR)
+	end
+
 	if S.moveMode ~= "teleport" then
 		local beyond = tonumber(S.walkTeleportBeyond) or 400
 		if dist <= beyond then
@@ -2400,6 +2519,26 @@ gbMove:CreateButton({
 	end,
 })
 
+-- *respawn-TP: the strongest bypass found. Kill, then jump in the post-spawn window.
+-- Costs one death per trip and strips the axe back to the backpack.*
+gbMove:CreateButton({
+	Name = "Mode: Respawn TP",
+	Callback = function()
+		S.moveMode = "respawn"
+		safe_set(WALK.label, "mode: respawn tp (kills you each trip)")
+	end,
+})
+
+gbMove:CreateSlider({
+	Name = "Respawn TP delay",
+	Range = {0, 100},
+	Increment = 5,
+	CurrentValue = math.floor((S.respawnDelay or 0.15) * 100),
+	Suffix = " ms",
+	Flag = "RespawnDelay",
+	Callback = function(n) S.respawnDelay = (tonumber(n) or 15) / 100 end,
+})
+
 gbMove:CreateSlider({
 	Name = "Walk speed",
 	Range = {16, 120},
@@ -3061,6 +3200,8 @@ local function sync_state_from_flags()
 	if type(v) == "boolean" then S.walkStripMap = v end
 	v = val("WalkTpFallback")
 	if type(v) == "boolean" then S.walkAllowTeleportFallback = v end
+	v = val("RespawnDelay")
+	if tonumber(v) then S.respawnDelay = (tonumber(v) or 15) / 100 end
 	v = val("PanicMode")
 	if type(v) == "boolean" then S.panicOn = v end
 	v = val("PanicRadius")
