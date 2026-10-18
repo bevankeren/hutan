@@ -772,6 +772,28 @@ Job   : 14baa559-5036-4063-8087-ea3fdd422ae2
 - Fungsi `S.set_hide_ingame_name` hanya menargetkan `ReactWorld` dan `PlayerList`.
 - File `farm_hub.lua` dan `history.md` siap di-commit dan di-push ke GitHub repository.
 
+---
+
+## 2026-10-18 19:24:00 +07:00 — rilis build terobfuskasi (Centurion v6.2) ke GitHub
+
+Game  : Foresters 🌳 [RELEASE]
+Place : 117020342702668
+Client: 0.743.0.7431134
+Job   : 14baa559-5036-4063-8087-ea3fdd422ae2
+
+### Perubahan
+- Mengganti `farm_hub.lua` di repositori dengan build terobfuskasi Centurion v6.2 dari `C:\Users\bevan\Downloads\farm_hub.lua` (829.998 bytes) untuk didistribusikan secara publik.
+- Menyimpan salinan kode sumber asli non-obfuskasi di `farm_hub_src.lua` dan menambahkannya ke `.gitignore` agar source code tetap aman di mesin lokal.
+- Men-stage, meng-commit, dan meng-push `farm_hub.lua`, `.gitignore`, dan `history.md` ke GitHub repository.
+
+### Alasan
+- Permintaan Captain: `yg di push ke github yg ini aja "C:\Users\bevan\Downloads\farm_hub.lua"`.
+
+### Bukti
+- File `farm_hub.lua` berukuran 829.998 bytes (header Centurion v6.2).
+- Source lokal tersimpan aman di `farm_hub_src.lua`.
+- Berhasil di-push ke GitHub `origin/main`.
+
 
 
 
