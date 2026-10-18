@@ -340,18 +340,18 @@ function WALK.leg(target, speed)
 	if not (root and hum) then return false end
 
 	WALK.stand()
-	-- *collision stays off so the walker cannot wedge on rocks or trunks — measured:
-	-- a single collidable frame pinned MoveDirection to 0 with the target 150 studs away.
-	-- The trade is that nothing stops a freefall, so the floor is policed by raycast
-	-- below: if the character sinks under the surface it gets lifted back on.*
-	WALK.noclip(false)
+	-- *walk with collision ON. Full noclip was the earlier mistake: with every part
+	-- non-collidable the humanoid has no ground contact, so it freefalls through the
+	-- map — measured 569 studs covered then death at health 2. Collision is only
+	-- dropped for a short unstick burst when the walker actually stalls.*
+	WALK.noclip(true)
 	pcall(function() hum.WalkSpeed = speed end)
 	pcall(function() hum:MoveTo(target) end)
 
 	local deadline = os.clock() + WALK.legTimeout
 	local lastPos = root.Position
-	local lastY = root.Position.Y
 	local stall = 0
+	local unsticking = false
 
 	local rp = RaycastParams.new()
 	rp.FilterType = Enum.RaycastFilterType.Exclude
@@ -360,35 +360,28 @@ function WALK.leg(target, speed)
 	while os.clock() < deadline do
 		if not alive() then return false end
 		task.wait(0.1)
-		-- *re-assert noclip every tick: something in this game re-enables it*
-		WALK.noclip(false)
 
 		local now = root.Position
 		local moved = (now - lastPos).Magnitude
 		lastPos = now
 
-		-- *void guard: noclip means a missed floor is a freefall straight out of the
-		-- world, which killed the character mid-walk (measured: 569 studs covered, then
-		-- health 2). Raycast down and lift back onto the surface when we drop through.*
-		if now.Y < lastY - 6 then
-			local hit = workspace:Raycast(Vector3.new(now.X, now.Y + 60, now.Z), Vector3.new(0, -200, 0), rp)
-			if hit then
-				root.CFrame = CFrame.new(now.X, hit.Position.Y + 3.5, now.Z) * (root.CFrame - root.Position)
-				root.AssemblyLinearVelocity = Vector3.zero
-			elseif now.Y < -40 then
-				return false
-			end
-			lastY = root.Position.Y
-		else
-			lastY = now.Y
-		end
-
-		if (root.Position - target).Magnitude <= 9 then return true end
+		if (now - target).Magnitude <= 9 then return true end
 
 		if moved < 0.5 then
 			stall += 1
-			-- *~1.5s without progress means real geometry, not waypoint handoff*
-			if stall >= 15 then return false end
+			-- *~0.8s pinned: drop collision for a moment so it can slip past the
+			-- obstacle, then restore and keep walking*
+			if stall >= 8 and not unsticking then
+				unsticking = true
+				WALK.noclip(false)
+				task.wait(0.35)
+				WALK.noclip(true)
+				pcall(function() hum:MoveTo(target) end)
+				stall = 0
+				unsticking = false
+			elseif stall >= 22 then
+				return false
+			end
 		else
 			stall = 0
 		end
@@ -409,7 +402,6 @@ function WALK.go(dest)
 
 	WALK.stand()
 	if strip then WALK.strip() end
-	WALK.noclip(false)
 
 	local ok, reached = pcall(function()
 		local pf = game:GetService("PathfindingService")
