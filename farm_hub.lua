@@ -85,6 +85,7 @@ do
 		prev.farm = false
 		prev.autobuy = false
 		prev.perfectOn = false
+		prev.levelingOn = false
 		local ok, old = pcall(function() return getgenv().ForestFarm end)
 		if ok and type(old) == "table" and type(old.stop) == "function" then
 			pcall(old.stop)
@@ -788,7 +789,7 @@ local function get_tree_stand(tree, fromPos, forceRandom)
 			trunkRadius = math.max(trunk.Size.X, trunk.Size.Z) / 2
 		end
 	end
-	local safeDist = math.clamp(trunkRadius + 3.2, 4.5, 10.5)
+	local safeDist = math.clamp(trunkRadius + 3.0, 4.5, 26.0)
 
 	local dir
 	if forceRandom then
@@ -3066,8 +3067,9 @@ do
 
 	local felledCount = 0
 	local startTime = 0
-	local levelSpeed = 24
+	local levelSpeed = 28
 	local autoLevelingToggle = nil
+	local unreachable = {}
 
 	local function update_stats()
 		levelFelledLabel:Set(tostring(felledCount) .. " trees")
@@ -3080,49 +3082,64 @@ do
 		end
 	end
 
-	local function smart_walk(targetPos, speed, stopDist)
+	local function find_walkable_stand(tree, myPos)
+		local basePos = tree:GetPivot().Position
+		local trunkWidth = tonumber(tree:GetAttribute("TrunkWidth"))
+		local trunkRadius = 2.0
+		if trunkWidth and trunkWidth > 0 then
+			trunkRadius = trunkWidth / 2
+		else
+			local trunk = tree:FindFirstChild("Trunk") or tree:FindFirstChild("Wood") or tree.PrimaryPart
+			if trunk and trunk:IsA("BasePart") then
+				trunkRadius = math.max(trunk.Size.X, trunk.Size.Z) / 2
+			end
+		end
+
+		local safeDist = math.clamp(trunkRadius + 2.8, 4.2, 26.0)
+		local pf = game:GetService("PathfindingService")
+
+		local delta = myPos - basePos
+		local primaryAngle = math.atan2(delta.Z, delta.X)
+		local angleOffsets = {0, math.pi/4, -math.pi/4, math.pi/2, -math.pi/2, 3*math.pi/4, -3*math.pi/4, math.pi}
+
+		for _, off in ipairs(angleOffsets) do
+			local ang = primaryAngle + off
+			local candPos = basePos + Vector3.new(math.cos(ang), 0, math.sin(ang)) * safeDist
+			local ray = workspace:Raycast(candPos + Vector3.new(0, 25, 0), Vector3.new(0, -50, 0))
+			if ray and ray.Material ~= Enum.Material.Water then
+				local standPos = Vector3.new(candPos.X, ray.Position.Y + 3.0, candPos.Z)
+				local path = pf:CreatePath({
+					AgentRadius = 2.0,
+					AgentHeight = 5.0,
+					AgentCanJump = true,
+					AgentJumpHeight = 8.5,
+					AgentMaxSlope = 58,
+					WaypointSpacing = 4.5,
+					Costs = {
+						Water = math.huge,
+						Danger = math.huge,
+					}
+				})
+				local ok = pcall(function() path:ComputeAsync(myPos, standPos) end)
+				if ok and path.Status == Enum.PathStatus.Success and #path:GetWaypoints() >= 2 then
+					return standPos, path
+				end
+			end
+		end
+		return nil, nil
+	end
+
+	local function smart_walk_path(path, targetPos, speed, stopDist)
 		local char = plr.Character
 		local root = char and char:FindFirstChild("HumanoidRootPart")
 		local hum = char and char:FindFirstChildOfClass("Humanoid")
 		if not (root and hum) then return false, "no character" end
 
-		speed = speed or 24
-		stopDist = stopDist or 6.5
+		speed = speed or levelSpeed or 28
+		stopDist = stopDist or 2.8
 		hum.WalkSpeed = speed
 
-		local dist = (targetPos - root.Position).Magnitude
-		if dist <= stopDist then return true end
-
-		local pf = game:GetService("PathfindingService")
-		local path = pf:CreatePath({
-			AgentRadius = 2.0,
-			AgentHeight = 5.0,
-			AgentCanJump = true,
-			AgentJumpHeight = 7.5,
-			AgentMaxSlope = 60,
-			WaypointSpacing = 5,
-		})
-
-		local computed = false
-		for _ = 1, 2 do
-			local okC = pcall(function() path:ComputeAsync(root.Position, targetPos) end)
-			if okC and path.Status == Enum.PathStatus.Success then
-				computed = true
-				break
-			end
-			task.wait(0.15)
-		end
-
-		if not computed then
-			hum:MoveTo(targetPos)
-			local t0 = os.clock()
-			while os.clock() - t0 < 3.5 do
-				if not alive() or not S.levelingOn then return false end
-				if (root.Position - targetPos).Magnitude <= stopDist then return true end
-				task.wait(0.1)
-			end
-			return (root.Position - targetPos).Magnitude <= stopDist + 2.5
-		end
+		if (targetPos - root.Position).Magnitude <= stopDist then return true end
 
 		local waypoints = path:GetWaypoints()
 		local i = 2
@@ -3131,6 +3148,8 @@ do
 
 		while i <= #waypoints do
 			if not alive() or not S.levelingOn then return false end
+			hum.WalkSpeed = speed
+
 			local wp = waypoints[i]
 			if wp.Action == Enum.PathWaypointAction.Jump then
 				pcall(function() hum.Jump = true end)
@@ -3138,21 +3157,39 @@ do
 			hum:MoveTo(wp.Position)
 
 			local tWp = os.clock()
-			while os.clock() - tWp < 1.2 do
+			while os.clock() - tWp < 1.4 do
 				if not alive() or not S.levelingOn then return false end
 				task.wait(0.04)
 				local curPos = root.Position
+
+				if hum:GetState() == Enum.HumanoidStateType.Swimming or curPos.Y < 4.2 then
+					pcall(function() hum.Jump = true end)
+					hum:MoveTo(REDWOOD_SPAWN)
+					task.wait(0.1)
+				end
+
 				if (curPos - targetPos).Magnitude <= stopDist then
 					return true
 				end
-				if (curPos - wp.Position).Magnitude <= 3.5 then
+				if (curPos - wp.Position).Magnitude <= 3.2 then
 					break
 				end
+
 				if (curPos - lastPos).Magnitude < 0.25 then
 					stall += 1
-					if stall >= 8 then
+					if stall >= 2 then
 						pcall(function() hum.Jump = true end)
-						stall = 0
+					end
+					if stall >= 4 then
+						local moveDir = (wp.Position - curPos) * Vector3.new(1, 0, 1)
+						if moveDir.Magnitude > 0.1 then
+							local perp = Vector3.new(-moveDir.Z, 0, moveDir.X).Unit * (math.random() > 0.5 and 4.8 or -4.8)
+							hum:MoveTo(curPos + perp)
+							task.wait(0.18)
+						end
+					end
+					if stall >= 9 then
+						return false, "stuck"
 					end
 				else
 					stall = 0
@@ -3164,11 +3201,11 @@ do
 
 		hum:MoveTo(targetPos)
 		local tEnd = os.clock()
-		while os.clock() - tEnd < 1.8 do
-			if (root.Position - targetPos).Magnitude <= stopDist then return true end
-			task.wait(0.08)
+		while os.clock() - tEnd < 1.4 do
+			if (root.Position - targetPos).Magnitude <= stopDist + 1.2 then return true end
+			task.wait(0.06)
 		end
-		return (root.Position - targetPos).Magnitude <= stopDist + 2.5
+		return (root.Position - targetPos).Magnitude <= stopDist + 1.8
 	end
 
 	local function leveling_chop(tree)
@@ -3177,6 +3214,7 @@ do
 		settle_on_ground()
 
 		local char = plr.Character
+		local root = char and char:FindFirstChild("HumanoidRootPart")
 		local axeTool = nil
 		if char then
 			for _, c in ipairs(char:GetChildren()) do
@@ -3210,14 +3248,18 @@ do
 			end)
 		end
 
-		local trunk = tree:FindFirstChild("Trunk") or tree.PrimaryPart or tree:GetPivot()
-		local trunkPos = trunk.Position
-		local cam = workspace.CurrentCamera
-		if cam then
-			cam.CFrame = CFrame.lookAt(cam.CFrame.Position, trunkPos)
+		local basePivot = tree:GetPivot().Position
+		if root then
+			root.CFrame = CFrame.lookAt(root.Position, Vector3.new(basePivot.X, root.Position.Y, basePivot.Z))
 		end
-		task.wait(0.05)
-		local vp = cam and cam:WorldToViewportPoint(trunkPos) or Vector3.new(200, 200, 0)
+
+		local cam = workspace.CurrentCamera
+		local eyeTrunk = root and Vector3.new(basePivot.X, root.Position.Y + 1.5, basePivot.Z) or basePivot
+		if cam then
+			cam.CFrame = CFrame.lookAt(cam.CFrame.Position, eyeTrunk)
+		end
+		task.wait(0.04)
+		local vp = cam and cam:WorldToViewportPoint(eyeTrunk) or Vector3.new(200, 200, 0)
 		local screenPos = Vector2.new(vp.X, vp.Y) - GuiService:GetGuiInset()
 
 		ChopController:BeginWindup(axeTool, screenPos)
@@ -3226,7 +3268,7 @@ do
 		ChopController:ReleaseWindup()
 
 		local sessionStarted = false
-		for _ = 1, 30 do
+		for _ = 1, 24 do
 			if not alive() or not S.levelingOn then
 				pcall(function() ChopController:Cancel() end)
 				if animConn then pcall(function() animConn:Disconnect() end) end
@@ -3237,6 +3279,29 @@ do
 				break
 			end
 			task.wait(0.05)
+		end
+
+		if not sessionStarted and root then
+			local closerPos = root.Position + (eyeTrunk - root.Position).Unit * 1.5
+			root.CFrame = CFrame.lookAt(closerPos, Vector3.new(basePivot.X, closerPos.Y, basePivot.Z))
+			task.wait(0.05)
+			if cam then cam.CFrame = CFrame.lookAt(cam.CFrame.Position, eyeTrunk) end
+			local vp2 = cam and cam:WorldToViewportPoint(eyeTrunk) or Vector3.new(200, 200, 0)
+			ChopController:BeginWindup(axeTool, Vector2.new(vp2.X, vp2.Y) - GuiService:GetGuiInset())
+			task.wait(fillSec)
+			ChopController:ReleaseWindup()
+			for _ = 1, 16 do
+				if not alive() or not S.levelingOn then
+					pcall(function() ChopController:Cancel() end)
+					if animConn then pcall(function() animConn:Disconnect() end) end
+					return false, "cancelled"
+				end
+				if ChopState.session() ~= nil then
+					sessionStarted = true
+					break
+				end
+				task.wait(0.05)
+			end
 		end
 
 		if not sessionStarted then
@@ -3273,7 +3338,7 @@ do
 									Position = Vector3.new(hitBtn.AbsolutePosition.X, hitBtn.AbsolutePosition.Y, 0)
 								}
 								pcall(function() firesignal(hitBtn.InputBegan, fakeInput, false) end)
-								task.wait(0.04)
+								task.wait(0.05)
 								break
 							end
 						end
@@ -3303,9 +3368,10 @@ do
 		local trees = workspace.Map:FindFirstChild("Trees")
 		if not trees then return nil end
 
+		local now = os.clock()
 		local candidates = {}
 		for _, t in ipairs(trees:GetChildren()) do
-			if is_live(t) and not is_growing(t) then
+			if is_live(t) and not is_growing(t) and not (unreachable[t] and now < unreachable[t]) then
 				local tp = t:GetPivot().Position
 				if is_in_redwood(tp) then
 					local d = (tp - myPos).Magnitude
@@ -3325,6 +3391,7 @@ do
 		task.spawn(function()
 			startTime = os.clock()
 			felledCount = 0
+			table.clear(unreachable)
 			update_stats()
 
 			while S.levelingOn and alive() do
@@ -3358,19 +3425,35 @@ do
 					continue
 				end
 
-				local standPos = get_tree_stand(target, myRoot.Position, false)
+				local standPos, path = find_walkable_stand(target, myRoot.Position)
+				if not (standPos and path) then
+					unreachable[target] = os.clock() + 45
+					levelStateLabel:Set("rerouting", "Warning")
+					task.wait(0.2)
+					continue
+				end
+
 				levelTargetLabel:Set(tostring(info.name) .. " (" .. tostring(math.floor(info.dist)) .. "m)")
 				levelStateLabel:Set("walking", "Warning")
 
-				local reached = smart_walk(standPos, levelSpeed, 7.5)
+				local reached, why = smart_walk_path(path, standPos, levelSpeed, 2.8)
 				if not S.levelingOn or not alive() then break end
 
-				if reached and target.Parent and is_live(target) then
+				if not reached then
+					unreachable[target] = os.clock() + 30
+					levelStateLabel:Set("path failed", "Warning")
+					task.wait(0.2)
+					continue
+				end
+
+				if target.Parent and is_live(target) then
 					levelStateLabel:Set("chopping", "Success")
-					local felled, why = leveling_chop(target)
+					local felled, chopWhy = leveling_chop(target)
 					if felled then
 						felledCount += 1
 						update_stats()
+					else
+						unreachable[target] = os.clock() + 15
 					end
 				end
 
@@ -3413,11 +3496,11 @@ do
 	gbLevelControls:CreateSlider({
 		Name = "Walk Speed",
 		Flag = "LevelingWalkSpeed",
-		Range = {16, 28},
+		Range = {16, 32},
 		Increment = 1,
-		CurrentValue = 24,
+		CurrentValue = 28,
 		Callback = function(val)
-			levelSpeed = tonumber(val) or 24
+			levelSpeed = tonumber(val) or 28
 		end,
 	})
 
@@ -3439,7 +3522,7 @@ do
 
 	gbLevelControls:CreateParagraph({
 		Title = "Redwood Leveling Specs",
-		Content = "Exclusively targets high-XP Redwood trees. Walks via legit Smart Pathfinding (no noclip, collision ON). Chopping runs with muted swing animations for maximum time efficiency.",
+		Content = "Exclusively targets high-XP Redwood trees. Walks via legit Smart Pathfinding (multi-angle route resolution, wall & cliff avoidance, anti-drowning, obstacle dodge). Fast chopping with muted animations.",
 	})
 end
 
