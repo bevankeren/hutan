@@ -128,6 +128,16 @@ S.maxRows = tonumber(S.maxRows) or 8
 S.weightValue = type(S.weightValue) == "number" and S.weightValue or 0.6
 S.includeGrowing = S.includeGrowing == true
 S.sameIslandOnly = S.sameIslandOnly ~= false
+-- *movement: 'walk' is the default because the CFrame teleport still trips the
+-- server on long runs. Walk drives Humanoid:MoveTo along a PathfindingService path,
+-- which is ordinary locomotion the server replicates without complaint. The map has a
+-- continuous seabed at Y=0, so paths exist between every island.*
+S.moveMode = (S.moveMode == "teleport") and "teleport" or "walk"
+S.walkSpeed = tonumber(S.walkSpeed) or 32
+S.walkTeleportBeyond = tonumber(S.walkTeleportBeyond) or 400
+S.walkStripMap = S.walkStripMap ~= false
+S.walkTimeout = tonumber(S.walkTimeout) or 45
+S.walkAllowTeleportFallback = S.walkAllowTeleportFallback == true
 do
 	local e = S.esp
 	e.players = e.players or false
@@ -222,6 +232,213 @@ local HUG_OFFSET = 3.5
 local STAND_HEIGHT = 0.5
 local attachYaw = 0
 
+-- *WALK MODE — the reliable path.
+--
+-- The CFrame teleport is an unauthorised displacement: it holds for short hops, then
+-- either snaps back or (on long runs) exhausts VRAM and crashpads the client. Walking
+-- is ordinary locomotion the server replicates, so there is nothing to flag.
+--
+-- PathfindingService produces a legal route across the map because every island sits
+-- in one continuous seabed at Y=0 (verified by raycast along Oak -> Dusty Mesa: solid
+-- Terrain at Y=0 for the entire crossing). Humanoid:MoveTo then follows it on foot.
+--
+-- Collision is disabled on the character for the trip so the walker never snags on
+-- fences, roots or tree trunks; it is restored on arrival.
+--
+-- Kept as one table on purpose: this file is at Lua's 200-local ceiling.*
+local WALK = {
+	legTimeout = 8,
+	active = false,
+	stripped = nil,
+	label = nil,
+}
+-- *exposed for console testing and so the snipe path can reach it from anywhere*
+getgenv().__ForestFarmWalk = WALK
+
+function WALK.noclip(state)
+	local char = plr.Character
+	if not char then return end
+	for _, p in ipairs(char:GetDescendants()) do
+		if p:IsA("BasePart") then pcall(function() p.CanCollide = state end) end
+	end
+end
+
+-- *shed decorative layers during a long walk: on a 2 GB card the streaming queue is
+-- what kills the client, and the path crosses three biomes*
+function WALK.strip()
+	if WALK.stripped then return end
+	WALK.stripped = {}
+	local map = workspace:FindFirstChild("Map")
+	if not map then WALK.stripped = nil return end
+	for _, d in ipairs(map:GetDescendants()) do
+		if d:IsA("ParticleEmitter") or d:IsA("Beam") or d:IsA("Trail")
+			or d:IsA("Fire") or d:IsA("Smoke") or d:IsA("Sparkles") then
+			if d.Enabled then
+				WALK.stripped[#WALK.stripped + 1] = d
+				pcall(function() d.Enabled = false end)
+			end
+		end
+	end
+end
+
+function WALK.unstrip()
+	if not WALK.stripped then return end
+	for _, d in ipairs(WALK.stripped) do
+		if d.Parent then pcall(function() d.Enabled = true end) end
+	end
+	WALK.stripped = nil
+end
+
+-- *one leg of the trip: MoveTo a point and wait until the humanoid reports arrival,
+-- or until it stops making progress. Returns true on arrival.
+--
+-- Tolerances matter: WaypointSpacing is 8 studs, so a 4-stud arrival radius makes the
+-- stall detector fire on ordinary waypoint handoff. Arrival is 9 studs and a stall needs
+-- a full second of no movement before it counts.*
+function WALK.leg(target, speed)
+	local char = plr.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not (root and hum) then return false end
+
+	pcall(function() hum.WalkSpeed = speed end)
+	pcall(function() hum:MoveTo(target) end)
+
+	local deadline = os.clock() + WALK.legTimeout
+	local lastPos = root.Position
+	local stall = 0
+
+	while os.clock() < deadline do
+		if not alive() then return false end
+		task.wait(0.1)
+		local now = root.Position
+		local moved = (now - lastPos).Magnitude
+		lastPos = now
+
+		if (now - target).Magnitude <= 9 then return true end
+
+		if moved < 0.5 then
+			stall += 1
+			-- *~1.5s without progress means real geometry, not waypoint handoff*
+			if stall >= 15 then return false end
+		else
+			stall = 0
+		end
+	end
+	return (root.Position - target).Magnitude <= 12
+end
+
+function WALK.go(dest)
+	local char = plr.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not (root and hum) then return false, "no character" end
+	if WALK.active then return false, "already walking" end
+
+	WALK.active = true
+	local speed = math.clamp(tonumber(S.walkSpeed) or 32, 16, 120)
+	local strip = S.walkStripMap ~= false
+
+	if strip then WALK.strip() end
+	WALK.noclip(false)
+
+	local ok, reached = pcall(function()
+		local pf = game:GetService("PathfindingService")
+		local dist = (dest - root.Position).Magnitude
+
+		-- *short hop: straight line is enough and avoids a path computation*
+		if dist <= 40 then
+			for _ = 1, 2 do
+				if WALK.leg(dest, speed) then return true end
+			end
+			return (root.Position - dest).Magnitude <= 8
+		end
+
+		local path = pf:CreatePath({
+			AgentRadius = 2.5,
+			AgentHeight = 5,
+			AgentCanJump = true,
+			AgentJumpHeight = 7,
+			AgentMaxSlope = 60,
+			WaypointSpacing = 8,
+		})
+
+		local computed = false
+		for _ = 1, 3 do
+			local okC = pcall(function()
+				path:ComputeAsync(root.Position, dest)
+			end)
+			if okC and path.Status == Enum.PathStatus.Success then
+				computed = true
+				break
+			end
+			task.wait(0.3)
+		end
+
+		if not computed then
+			-- *no legal path: fall back to a straight run at the target*
+			for _ = 1, 2 do
+				if WALK.leg(dest, speed) then return true end
+			end
+			return (root.Position - dest).Magnitude <= 10
+		end
+
+		local waypoints = path:GetWaypoints()
+		local i = 2 -- *skip index 1: it is the point under our feet*
+		local recomputes = 0
+		while i <= #waypoints do
+			if not alive() then return false end
+			local wp = waypoints[i]
+			if wp.Action == Enum.PathWaypointAction.Jump then
+				pcall(function() hum.Jump = true end)
+			end
+			if WALK.leg(wp.Position, speed) then
+				i += 1
+			else
+				-- *recompute on a stuck leg; allow a few before giving up, because a
+				-- single snag on a root or fence is not a failed trip*
+				recomputes += 1
+				if recomputes > 4 then
+					return (root.Position - dest).Magnitude <= 30
+				end
+				local okR = pcall(function()
+					path:ComputeAsync(root.Position, dest)
+				end)
+				if okR and path.Status == Enum.PathStatus.Success then
+					waypoints = path:GetWaypoints()
+					i = 2
+					task.wait(0.15)
+				else
+					-- *path genuinely gone: close the gap directly before quitting*
+					for _ = 1, 3 do
+						if WALK.leg(dest, speed) then return true end
+					end
+					return (root.Position - dest).Magnitude <= 30
+				end
+			end
+		end
+		-- *final approach: the last waypoint can sit above the tree base, so close the
+		-- gap with a couple of direct legs before declaring failure*
+		for _ = 1, 3 do
+			if (root.Position - dest).Magnitude <= 12 then return true end
+			WALK.leg(dest, speed)
+		end
+		return (root.Position - dest).Magnitude <= 20
+	end)
+
+	WALK.noclip(true)
+	if strip then
+		task.wait(0.1)
+		WALK.unstrip()
+	end
+	pcall(function() hum:MoveTo(root.Position) end)
+	pcall(function() hum.WalkSpeed = 16 end)
+	WALK.active = false
+
+	if not ok then return false, tostring(reached) end
+	return reached == true
+end
+
 -- *anchored-root transit bypass:
 -- Anchoring ONLY the HumanoidRootPart takes the character out of the physics solver
 -- (no contacts, no impulses, no penetration resolution) while keeping the assembly
@@ -248,6 +465,28 @@ local function teleport_to(pos, offset, finalFacing)
 	local from = root.Position
 	local delta = dest - from
 	local dist = delta.Magnitude
+
+	-- *movement dispatcher: walk is the default because it is server-legal. The
+	-- teleport branch is kept as the opt-in fallback for players who accept the risk,
+	-- and it is used automatically when a walk would be absurdly long.*
+	if S.moveMode ~= "teleport" then
+		local beyond = tonumber(S.walkTeleportBeyond) or 400
+		if dist <= beyond then
+			local okW, whyW = WALK.go(dest)
+			if okW then
+				if finalFacing then
+					local r2 = hrp()
+					if r2 then r2.CFrame = CFrame.new(r2.Position) * (finalFacing - finalFacing.Position) end
+				end
+				return true
+			end
+			-- *walk failed: fall through to the teleport only if the player allowed it,
+			-- otherwise report the walk error so the caller can pick another tree*
+			if S.walkAllowTeleportFallback ~= true then
+				return false, "walk failed: " .. tostring(whyW)
+			end
+		end
+	end
 
 	if dist > 900 then
 		return false, "distance too far"
@@ -2078,6 +2317,62 @@ gbFarm:CreateToggle({
 	end,
 })
 
+-- *Movement: walk is the default. The teleport still trips the server on long runs,
+-- so walk gets first billing and the teleport sits behind an explicit opt-in.
+-- Kept in one table to stay under Lua's 200-local ceiling.*
+local gbMove = farmTab:CreateGroupbox({Name = "Movement", Side = "Right"})
+WALK.label = gbMove:CreateLabel("mode: walk")
+
+gbMove:CreateButton({
+	Name = "Mode: Walk",
+	Callback = function()
+		S.moveMode = "walk"
+		safe_set(WALK.label, "mode: walk")
+	end,
+})
+
+gbMove:CreateButton({
+	Name = "Mode: Teleport",
+	Callback = function()
+		S.moveMode = "teleport"
+		safe_set(WALK.label, "mode: teleport (may snap back)")
+	end,
+})
+
+gbMove:CreateSlider({
+	Name = "Walk speed",
+	Range = {16, 120},
+	Increment = 4,
+	CurrentValue = S.walkSpeed or 32,
+	Suffix = " st/s",
+	Flag = "WalkSpeed",
+	Callback = function(n) S.walkSpeed = n end,
+})
+
+gbMove:CreateSlider({
+	Name = "Walk, teleport beyond",
+	Range = {100, 900},
+	Increment = 50,
+	CurrentValue = S.walkTeleportBeyond or 400,
+	Suffix = " st",
+	Flag = "WalkBeyond",
+	Callback = function(n) S.walkTeleportBeyond = n end,
+})
+
+gbMove:CreateToggle({
+	Name = "Strip map while walking",
+	Flag = "WalkStrip",
+	CurrentValue = S.walkStripMap ~= false,
+	Callback = function(on) S.walkStripMap = on end,
+})
+
+gbMove:CreateToggle({
+	Name = "Teleport if walk fails",
+	Flag = "WalkTpFallback",
+	CurrentValue = S.walkAllowTeleportFallback == true,
+	Callback = function(on) S.walkAllowTeleportFallback = on end,
+})
+
 gbFarm:CreateSlider({
 	Name = "Panic radius",
 	Range = {30, 150},
@@ -2697,6 +2992,14 @@ local function sync_state_from_flags()
 	if type(v) == "boolean" then S.includeGrowing = v end
 	v = val("SameIslandOnly")
 	if type(v) == "boolean" then S.sameIslandOnly = v end
+	v = val("WalkSpeed")
+	if tonumber(v) then S.walkSpeed = tonumber(v) end
+	v = val("WalkBeyond")
+	if tonumber(v) then S.walkTeleportBeyond = tonumber(v) end
+	v = val("WalkStrip")
+	if type(v) == "boolean" then S.walkStripMap = v end
+	v = val("WalkTpFallback")
+	if type(v) == "boolean" then S.walkAllowTeleportFallback = v end
 	v = val("PanicMode")
 	if type(v) == "boolean" then S.panicOn = v end
 	v = val("PanicRadius")
