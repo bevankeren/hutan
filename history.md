@@ -890,6 +890,32 @@ Job   : c798c76f-88a7-4200-97ce-f2df779f7505
 - Nilai `rp.IgnoreWater = true` mencegah titik pendaratan tersangkut di atas permukaan air tanpa kolisi.
 - Kolisi karakter pulih 100% setelah teleport dan respawn jump.
 
+---
+
+## 2026-10-18 20:50:00 +07:00 — verifikasi live: performa jauh lebih lancar & stabil
+
+Game  : Foresters 🌳 [RELEASE]
+Place : 117020342702668
+Client: 0.743.0.7431134
+Job   : 22cf121d-280c-4481-903f-2f9b3de0560c
+
+### Perubahan
+- Skrip `farm_hub_src.lua` terbaru dieksekusi langsung pada client aktif `2acc7edf-a89b-46e8-b108-f61603d715a0`.
+- Memverifikasi status runtime:
+  - `loaded = true`
+  - `crashGuardHook = true`
+  - `discordTabVisible = true`
+  - UI Airflow aktif dan menampilkan seluruh tab (Home, Discord, Farm, Axes, Visual, Panic, Settings).
+
+### Alasan
+- Verifikasi hasil perbaikan stutter 3 detik dan void clipping langsung di lingkungan game aktif.
+
+### Bukti
+- Tangkapan layar in-game membuktikan UI hub termuat sempurna.
+- Konfirmasi langsung dari Captain: "peformanya jauh lebih baik dr sebelumnya, bagus".
+- Tidak ada lagi freeze 3 detik saat respawn-jump antar pulau dan autochop berjalan mulus.
+
+
 
 
 
