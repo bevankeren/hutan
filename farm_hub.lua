@@ -3070,6 +3070,8 @@ local function init_leveling_module()
 	local levelSpeed = 28
 	local autoLevelingToggle = nil
 	local unreachable = {}
+	local currentAbortFlag = false
+	local failcheckEnabled = true
 
 	local function update_stats()
 		levelFelledLabel:Set(tostring(felledCount) .. " trees")
@@ -3080,6 +3082,15 @@ local function init_leveling_module()
 				levelRateLabel:Set(tostring(rate) .. "/min")
 			end
 		end
+	end
+
+	local function safe_horiz_unit(v, fallback)
+		if not v then return fallback or Vector3.new(0, 0, -1) end
+		local h = Vector3.new(v.X, 0, v.Z)
+		if h.Magnitude > 0.05 then
+			return h.Unit
+		end
+		return fallback or Vector3.new(0, 0, -1)
 	end
 
 	local function make_spatial_params(char, extraExclude)
@@ -3122,9 +3133,9 @@ local function init_leveling_module()
 
 	local function evaluate_spatial_steering(curPos, desiredDir, rayParams, extraEx)
 		local candidateDegs = {0, 20, -20, 42, -42, 65, -65, 90, -90, 120, -120}
-		local bestDir = desiredDir
+		local horizDesired = safe_horiz_unit(desiredDir, Vector3.new(0, 0, -1))
+		local bestDir = horizDesired
 		local bestScore = -math.huge
-		local horizDesired = Vector3.new(desiredDir.X, 0, desiredDir.Z).Unit
 
 		for _, deg in ipairs(candidateDegs) do
 			local rad = math.rad(deg)
@@ -3144,7 +3155,7 @@ local function init_leveling_module()
 				if isNpc then
 					penalty += 45.0 / dist
 				else
-					penalty += 14.0 / dist
+					penalty += 16.0 / dist
 				end
 			end
 
@@ -3203,7 +3214,7 @@ local function init_leveling_module()
 			if groundY then
 				local standPos = Vector3.new(candPos.X, groundY.Y + 2.8, candPos.Z)
 				local path = pf:CreatePath({
-					AgentRadius = 2.2,
+					AgentRadius = 2.4,
 					AgentHeight = 5.0,
 					AgentCanJump = true,
 					AgentJumpHeight = 3.5,
@@ -3250,15 +3261,17 @@ local function init_leveling_module()
 		hum.WalkSpeed = speed
 		hum.AutoRotate = true
 
-		local treePivot = treeTarget and treeTarget:GetPivot().Position
+		local waypoints = path:GetWaypoints()
+		if not waypoints or #waypoints == 0 then return false, "no waypoints" end
+
+		local treePivot = treeTarget and treeTarget.Parent and treeTarget:GetPivot().Position
 		local reach = 13.0
 		pcall(function()
-			if ChopTuning and ChopTuning.ReachOf then
+			if treeTarget and treeTarget.Parent and ChopTuning and ChopTuning.ReachOf then
 				reach = ChopTuning.ReachOf(treeTarget) or 13.0
 			end
 		end)
 
-		local waypoints = path:GetWaypoints()
 		local rayParams = make_spatial_params(char, treeTarget)
 
 		local currIdx = 2
@@ -3271,9 +3284,18 @@ local function init_leveling_module()
 
 		while currIdx <= #waypoints and (os.clock() - tStart < maxTravelTime) do
 			if not alive() or not S.levelingOn then return false end
+			if currentAbortFlag then
+				currentAbortFlag = false
+				return false, "watchdog abort"
+			end
 			hum.WalkSpeed = speed
 
 			local curPos = root.Position
+
+			-- Validate that tree still exists
+			if treeTarget and not (treeTarget.Parent and is_live(treeTarget)) then
+				return false, "tree gone"
+			end
 
 			if treePivot then
 				local horizDist = ((curPos - treePivot) * Vector3.new(1, 0, 1)).Magnitude
@@ -3301,6 +3323,7 @@ local function init_leveling_module()
 				waterTime = 0
 			end
 
+			-- String Pulling with Bounds Safety
 			local lookIdx = currIdx
 			for j = math.min(currIdx + 4, #waypoints), currIdx + 1, -1 do
 				local candPos = waypoints[j].Position
@@ -3309,23 +3332,24 @@ local function init_leveling_module()
 					break
 				end
 			end
-			currIdx = lookIdx
+			currIdx = math.clamp(lookIdx, 1, #waypoints)
 			local targetWp = waypoints[currIdx]
+			if not targetWp then break end
 
 			local moveVector = (targetWp.Position - curPos) * Vector3.new(1, 0, 1)
-			if moveVector.Magnitude > 0.1 then
-				local forwardUnit = moveVector.Unit
-				local kneeRay = workspace:Raycast(curPos - Vector3.new(0, 1.0, 0), forwardUnit * 3.5, rayParams)
-				local chestRay = workspace:Raycast(curPos + Vector3.new(0, 0.6, 0), forwardUnit * 3.5, rayParams)
-				local headRay = workspace:Raycast(curPos + Vector3.new(0, 2.2, 0), forwardUnit * 3.5, rayParams)
+			local forwardUnit = safe_horiz_unit(moveVector, root.CFrame.LookVector)
 
-				if kneeRay and not chestRay then
+			-- Step-Up Auto Jump Feeler
+			local kneeRay = workspace:Raycast(curPos - Vector3.new(0, 1.0, 0), forwardUnit * 3.5, rayParams)
+			local chestRay = workspace:Raycast(curPos + Vector3.new(0, 0.6, 0), forwardUnit * 3.5, rayParams)
+			local headRay = workspace:Raycast(curPos + Vector3.new(0, 2.2, 0), forwardUnit * 3.5, rayParams)
+
+			if kneeRay and not chestRay then
+				pcall(function() hum.Jump = true end)
+			elseif chestRay and not headRay then
+				local checkSurface = workspace:Raycast(curPos + forwardUnit * 2.8 + Vector3.new(0, 4.0, 0), Vector3.new(0, -6.0, 0), rayParams)
+				if checkSurface and checkSurface.Position.Y - curPos.Y <= 3.8 and checkSurface.Normal.Y >= 0.7 then
 					pcall(function() hum.Jump = true end)
-				elseif chestRay and not headRay then
-					local checkSurface = workspace:Raycast(curPos + forwardUnit * 2.8 + Vector3.new(0, 4.0, 0), Vector3.new(0, -6.0, 0), rayParams)
-					if checkSurface and checkSurface.Position.Y - curPos.Y <= 3.8 and checkSurface.Normal.Y >= 0.7 then
-						pcall(function() hum.Jump = true end)
-					end
 				end
 			end
 
@@ -3333,9 +3357,7 @@ local function init_leveling_module()
 				pcall(function() hum.Jump = true end)
 			end
 
-			local steerDir = moveVector.Magnitude > 0.1 and moveVector.Unit or root.CFrame.LookVector
-			local evaluatedDir = evaluate_spatial_steering(curPos, steerDir, rayParams, treeTarget)
-
+			local evaluatedDir = evaluate_spatial_steering(curPos, forwardUnit, rayParams, treeTarget)
 			hum:MoveTo(curPos + evaluatedDir * 7.0)
 
 			task.wait(0.04)
@@ -3346,6 +3368,7 @@ local function init_leveling_module()
 				currIdx += 1
 			end
 
+			-- Advanced Multi-tier De-Wedge with Burst Noclip
 			if (root.Position - lastPos).Magnitude < 0.22 then
 				stallCount += 1
 				if stallCount == 3 then
@@ -3355,7 +3378,15 @@ local function init_leveling_module()
 					hum:MoveTo(root.Position + sideVec)
 					pcall(function() hum.Jump = true end)
 					task.wait(0.12)
-				elseif stallCount == 10 then
+				elseif stallCount >= 10 and stallCount <= 14 then
+					-- Micro-noclip burst: smoothly step through thin posts/railings
+					noclipOn = true
+					pcall(function() hum.Jump = true end)
+					hum:MoveTo(targetWp.Position)
+					task.wait(0.15)
+					noclipOn = false
+					restore_collide()
+				elseif stallCount == 15 then
 					local ok, newPath = pcall(function()
 						local p = pf:CreatePath({
 							AgentRadius = 3.2,
@@ -3373,12 +3404,12 @@ local function init_leveling_module()
 						waypoints = newPath:GetWaypoints()
 						currIdx = 2
 					end
-				elseif stallCount == 16 then
+				elseif stallCount == 20 then
 					local bwd = -root.CFrame.LookVector * 5.5
 					hum:MoveTo(root.Position + bwd)
 					pcall(function() hum.Jump = true end)
 					task.wait(0.2)
-				elseif stallCount >= 24 then
+				elseif stallCount >= 28 then
 					return false, "stuck"
 				end
 			else
@@ -3593,73 +3624,83 @@ local function init_leveling_module()
 	end
 
 	local function start_leveling_loop()
+		-- 1. Main Farming Loop
 		task.spawn(function()
 			startTime = os.clock()
 			felledCount = 0
 			table.clear(unreachable)
 			update_stats()
+			currentAbortFlag = false
 
 			while S.levelingOn and alive() do
-				local myRoot = hrp()
-				if not myRoot then
-					levelStateLabel:Set("no char", "Warning")
+				local okLoop, errLoop = pcall(function()
+					local myRoot = hrp()
+					if not myRoot then
+						levelStateLabel:Set("no char", "Warning")
+						task.wait(0.5)
+						return
+					end
+
+					if not is_in_redwood(myRoot.Position) then
+						S.levelingOn = false
+						if autoLevelingToggle then
+							pcall(function() autoLevelingToggle:Set(false) end)
+						end
+						levelStateLabel:Set("outside redwood", "Error")
+						levelTargetLabel:Set("Must be in Redwood Grove!")
+						Window:Notify({
+							Title = "Leveling Farm",
+							Content = "Auto Leveling stopped: You are outside Redwood Grove! Teleport there first.",
+							Duration = 4,
+						})
+						return
+					end
+
+					local target, info = get_best_redwood_tree()
+					if not target then
+						table.clear(unreachable)
+						levelStateLabel:Set("scanning trees", "Warning")
+						levelTargetLabel:Set("searching...")
+						task.wait(1.5)
+						return
+					end
+
+					local standPos, path = find_walkable_stand(target, myRoot.Position)
+					if not (standPos and path) then
+						unreachable[target] = os.clock() + 20
+						levelStateLabel:Set("rerouting", "Warning")
+						task.wait(0.2)
+						return
+					end
+
+					levelTargetLabel:Set(tostring(info.name) .. " (" .. tostring(math.floor(info.dist)) .. "m)")
+					levelStateLabel:Set("walking", "Warning")
+
+					local reached, why = smart_walk_spatial(path, standPos, levelSpeed, 2.8, target)
+					if not S.levelingOn or not alive() then return end
+
+					if not reached then
+						unreachable[target] = os.clock() + 20
+						levelStateLabel:Set("path failed", "Warning")
+						task.wait(0.2)
+						return
+					end
+
+					if target.Parent and is_live(target) then
+						levelStateLabel:Set("chopping", "Success")
+						local felled, chopWhy = leveling_chop(target)
+						if felled then
+							felledCount += 1
+							update_stats()
+						else
+							unreachable[target] = os.clock() + 15
+						end
+					end
+				end)
+
+				if not okLoop then
+					warn("[Leveling] Loop error recovered:", errLoop)
 					task.wait(0.5)
-					continue
-				end
-
-				if not is_in_redwood(myRoot.Position) then
-					S.levelingOn = false
-					if autoLevelingToggle then
-						pcall(function() autoLevelingToggle:Set(false) end)
-					end
-					levelStateLabel:Set("outside redwood", "Error")
-					levelTargetLabel:Set("Must be in Redwood Grove!")
-					Window:Notify({
-						Title = "Leveling Farm",
-						Content = "Auto Leveling stopped: You are outside Redwood Grove! Teleport there first.",
-						Duration = 4,
-					})
-					break
-				end
-
-				local target, info = get_best_redwood_tree()
-				if not target then
-					levelStateLabel:Set("scanning trees", "Warning")
-					levelTargetLabel:Set("no ready redwood tree")
-					task.wait(2)
-					continue
-				end
-
-				local standPos, path = find_walkable_stand(target, myRoot.Position)
-				if not (standPos and path) then
-					unreachable[target] = os.clock() + 45
-					levelStateLabel:Set("rerouting", "Warning")
-					task.wait(0.2)
-					continue
-				end
-
-				levelTargetLabel:Set(tostring(info.name) .. " (" .. tostring(math.floor(info.dist)) .. "m)")
-				levelStateLabel:Set("walking", "Warning")
-
-				local reached, why = smart_walk_spatial(path, standPos, levelSpeed, 2.8, target)
-				if not S.levelingOn or not alive() then break end
-
-				if not reached then
-					unreachable[target] = os.clock() + 30
-					levelStateLabel:Set("path failed", "Warning")
-					task.wait(0.2)
-					continue
-				end
-
-				if target.Parent and is_live(target) then
-					levelStateLabel:Set("chopping", "Success")
-					local felled, chopWhy = leveling_chop(target)
-					if felled then
-						felledCount += 1
-						update_stats()
-					else
-						unreachable[target] = os.clock() + 15
-					end
 				end
 
 				task.wait(0.2)
@@ -3667,6 +3708,69 @@ local function init_leveling_module()
 
 			levelStateLabel:Set("idle", "Muted")
 			levelTargetLabel:Set("-")
+		end)
+
+		-- 2. Dedicated Watchdog Failcheck System (Self-Healing Unstuck & Emergency Respawn)
+		task.spawn(function()
+			local stuckSecs = 0
+			local lastPos = nil
+			while S.levelingOn and alive() do
+				task.wait(1.0)
+				if not failcheckEnabled or not S.levelingOn then continue end
+
+				local myRoot = hrp()
+				local hum = plr.Character and plr.Character:FindFirstChildOfClass("Humanoid")
+				if myRoot and hum then
+					local curPos = myRoot.Position
+					local isChopping = false
+					pcall(function()
+						local okCS, ChopState = pcall(function() return require(plr.PlayerScripts.Source.state.ChopState) end)
+						if okCS and ChopState and ChopState.session() ~= nil then
+							isChopping = true
+						end
+					end)
+
+					if isChopping then
+						stuckSecs = 0
+						lastPos = curPos
+					else
+						local dMoved = lastPos and (curPos - lastPos).Magnitude or 10
+						if dMoved < 1.8 then
+							stuckSecs += 1
+							-- Tier 1 (3s stuck): Jump and side-hop
+							if stuckSecs == 3 then
+								pcall(function() hum.Jump = true end)
+								local sideVec = Vector3.new(-myRoot.CFrame.LookVector.Z, 0, root and root.CFrame.LookVector.X or 1) * 4.5
+								hum:MoveTo(curPos + sideVec)
+							-- Tier 2 (7s stuck): Micro-noclip impulse forward
+							elseif stuckSecs == 7 then
+								noclipOn = true
+								pcall(function() hum.Jump = true end)
+								hum:MoveTo(curPos + myRoot.CFrame.LookVector * 5.0)
+								task.wait(0.2)
+								noclipOn = false
+								restore_collide()
+							-- Tier 3 (14s stuck): Force abort current path & switch target
+							elseif stuckSecs == 14 then
+								currentAbortFlag = true
+								levelStateLabel:Set("rerouting (stuck)", "Warning")
+							-- Tier 4 (25s stuck): EMERGENCY FAILCHECK RESPAWN TO REDWOOD GROVE
+							elseif stuckSecs >= 25 then
+								levelStateLabel:Set("respawn failcheck", "Warning")
+								levelTargetLabel:Set("unsticking via respawn...")
+								currentAbortFlag = true
+								table.clear(unreachable)
+								stuckSecs = 0
+								WALK.respawnJump(REDWOOD_SPAWN)
+								task.wait(1.0)
+							end
+						else
+							stuckSecs = 0
+							lastPos = curPos
+						end
+					end
+				end
+			end
 		end)
 	end
 
@@ -3709,6 +3813,15 @@ local function init_leveling_module()
 		end,
 	})
 
+	gbLevelControls:CreateToggle({
+		Name = "Stuck Failcheck (Respawn Unstick)",
+		Flag = "LevelingFailcheck",
+		CurrentValue = true,
+		Callback = function(val)
+			failcheckEnabled = val
+		end,
+	})
+
 	gbLevelControls:CreateButton({
 		Name = "Teleport to Redwood Grove",
 		Callback = function()
@@ -3727,7 +3840,7 @@ local function init_leveling_module()
 
 	gbLevelControls:CreateParagraph({
 		Title = "Redwood Leveling Specs",
-		Content = "Exclusively targets high-XP Redwood trees. Spatial Navigation with Whisker Radar, Context-Based Steering, Line-of-Sight String Pulling, Step-Up Auto Jump, Anti-Drowning, and Elevation Awareness.",
+		Content = "Exclusively targets high-XP Redwood trees. Spatial Navigation with Whisker Radar, Context-Based Steering, Line-of-Sight String Pulling, Step-Up Auto Jump, Anti-Drowning, Watchdog Failcheck, and Elevation Awareness.",
 	})
 end
 init_leveling_module()
