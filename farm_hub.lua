@@ -184,8 +184,19 @@ end
 local function restore_collide()
 	local char = plr.Character
 	if not char then return end
+	-- *restore EVERY part, not just the ones savedCollide remembers. teleport_to
+	-- disables collision directly, and a part left CanCollide=false lets the
+	-- character sink through terrain into Swimming state, which the server reads
+	-- as AnticheatHop and reconnects the player.*
+	for _, d in ipairs(char:GetDescendants()) do
+		if d:IsA("BasePart") then
+			d.CanCollide = true
+			savedCollide[d] = nil
+		end
+	end
 	for d in pairs(savedCollide) do
 		if d.Parent then d.CanCollide = true end
+		savedCollide[d] = nil
 	end
 	local hum = char:FindFirstChildOfClass("Humanoid")
 	if hum then
@@ -228,13 +239,17 @@ local function teleport_to(pos, offset, finalFacing)
 	local delta = dest - from
 	local dist = delta.Magnitude
 
-	if dist > 280 then
-		return false, "cross-island distance blocked"
+	-- *island-spanning travel is legitimate inside one island (Oak Island alone is
+	-- ~580 studs wide). The cross-island guard lives in on_same_island(), not here,
+	-- so this ceiling only needs to stop absurd jumps.*
+	if dist > 900 then
+		return false, "distance too far"
 	end
 	if dist <= 8 then
 		root.CFrame = finalFacing or CFrame.new(dest)
 		root.AssemblyLinearVelocity = Vector3.zero
 		root.AssemblyAngularVelocity = Vector3.zero
+		task.wait(0.1)
 		return true
 	end
 
@@ -258,6 +273,8 @@ local function teleport_to(pos, offset, finalFacing)
 
 	local duration = dist / MOVE_SPEED
 	local steps = math.max(1, math.ceil(duration / 0.04))
+	local flatDelta = Vector3.new(dest.X - from.X, 0, dest.Z - from.Z)
+	local travelRot = (flatDelta.Magnitude > 0.1) and (CFrame.lookAt(Vector3.zero, flatDelta) - Vector3.zero) or (root.CFrame - root.Position)
 
 	for i = 1, steps do
 		if not alive() then
@@ -271,17 +288,28 @@ local function teleport_to(pos, offset, finalFacing)
 		local ray = workspace:Raycast(Vector3.new(curX, from.Y + 15, curZ), Vector3.new(0, -50, 0), rayParams)
 		local curY = ray and (ray.Position.Y + 2.5) or (from.Y + (dest.Y - from.Y) * frac)
 
-		root.CFrame = CFrame.lookAt(Vector3.new(curX, curY, curZ), dest)
+		root.CFrame = CFrame.new(curX, curY, curZ) * travelRot
 		task.wait(0.04)
 	end
 
-	root.CFrame = finalFacing or CFrame.new(dest)
+	-- *final landing must sit ON the ground, not below it. Placing the root at the
+	-- raw destination Y while collision is off lets the character sink into terrain,
+	-- which the server flags as AnticheatHop.*
+	local landRay = workspace:Raycast(Vector3.new(dest.X, dest.Y + 40, dest.Z), Vector3.new(0, -120, 0), rayParams)
+	local landY = landRay and (landRay.Position.Y + 2.8) or dest.Y
+	local landPos = Vector3.new(dest.X, landY, dest.Z)
+	local landRot = finalFacing and (finalFacing - finalFacing.Position) or travelRot
+	root.CFrame = CFrame.new(landPos) * landRot
 	root.AssemblyLinearVelocity = Vector3.zero
 	root.AssemblyAngularVelocity = Vector3.zero
 
-	task.wait(0.1)
+	task.wait(0.05)
 	noclipConn:Disconnect()
 	restore_collide()
+
+	-- *settle: give the humanoid a frame to re-ground itself before anything reads
+	-- its state, so we never chop while it is still Swimming/Falling.*
+	task.wait(0.2)
 	return true
 end
 
@@ -322,10 +350,21 @@ local function equip_axe()
 	if not backpack then return false end
 	local hum = char:FindFirstChildOfClass("Humanoid")
 	if not hum then return false end
+
+	-- *the game gates axe equipping behind AxeService, so a bare Humanoid:EquipTool
+	-- often silently does nothing. Ask the service first, then fall back to EquipTool.*
 	for _, c in ipairs(backpack:GetChildren()) do
 		if c:IsA("Tool") and c.Name:match("Axe") then
+			local axeId = c:GetAttribute("AxeId")
+			if axeId then
+				pcall(function() call(AxeService, "EquipAxe", axeId) end)
+				for _ = 1, 16 do
+					if held() then return true end
+					task.wait(0.05)
+				end
+			end
 			pcall(function() hum:EquipTool(c) end)
-			for _ = 1, 12 do
+			for _ = 1, 16 do
 				if held() then return true end
 				task.wait(0.05)
 			end
@@ -695,65 +734,6 @@ local function top_score(t)
 	local moneyTerm = math.log10(1 + money)
 	local rareTerm = math.log10(1 + odds) * 0.35 + math.log10(rare) * 2
 	return (1 - w) * moneyTerm + w * rareTerm, money, odds
-end
-
-local function hop_to_low_server()
-	local TS = game:GetService("TeleportService")
-	local HS = game:GetService("HttpService")
-	local here = #game.Players:GetPlayers()
-
-	local fetch = (typeof(http_request) == "function" and http_request)
-		or (typeof(request) == "function" and request)
-		or nil
-	if not fetch then
-		task.spawn(function()
-			pcall(function() TS:Teleport(game.PlaceId, plr) end)
-		end)
-		return ("rejoin (%d here)"):format(here)
-	end
-
-	local ok, res = pcall(fetch, {
-		Url = ("https://games.roblox.com/v1/games/%d/servers/Public?limit=100&excludeFullGames=true"):format(game.PlaceId),
-		Method = "GET",
-	})
-	local body = ok and res and (res.Body or res.body)
-	if not body then
-		task.spawn(function()
-			pcall(function() TS:Teleport(game.PlaceId, plr) end)
-		end)
-		return "rejoin (api fail)"
-	end
-
-	local okJ, data = pcall(function() return HS:JSONDecode(body) end)
-	if not okJ or type(data) ~= "table" or type(data.data) ~= "table" then
-		task.spawn(function()
-			pcall(function() TS:Teleport(game.PlaceId, plr) end)
-		end)
-		return "rejoin (bad json)"
-	end
-
-	local best = nil
-	for _, s in ipairs(data.data) do
-		if type(s) == "table" and type(s.id) == "string" and s.id ~= game.JobId then
-			local n = tonumber(s.playing) or 999
-			local max = tonumber(s.maxPlayers) or 20
-			if n < max and (not best or n < best.count) then
-				best = {count = n, id = s.id}
-			end
-		end
-	end
-
-	if not best then
-		return "no other public server"
-	end
-	if best.count + 1 >= here then
-		return ("already among quietest (%d here, best %d)"):format(here, best.count)
-	end
-
-	task.spawn(function()
-		pcall(function() TS:TeleportToPlaceInstance(game.PlaceId, best.id, plr) end)
-	end)
-	return ("hop: %d here -> %d/20"):format(here, best.count)
 end
 
 local ESP = {folder = nil, treeTags = {}, playerTags = {}, merchTags = {}, conns = {}, counts = {}}
@@ -1234,11 +1214,33 @@ local function pick(mode, blocked)
 	return list[1]
 end
 
+local function settle_on_ground()
+	local root = hrp()
+	local char = plr.Character
+	if not root or not char then return end
+	-- collision must be on, or the character keeps sinking
+	for _, p in ipairs(char:GetDescendants()) do
+		if p:IsA("BasePart") and not p.CanCollide then p.CanCollide = true end
+	end
+	local rp = RaycastParams.new()
+	rp.FilterType = Enum.RaycastFilterType.Exclude
+	rp.FilterDescendantsInstances = {char}
+	local pos = root.Position
+	local ray = workspace:Raycast(Vector3.new(pos.X, pos.Y + 80, pos.Z), Vector3.new(0, -220, 0), rp)
+	if ray and (ray.Position.Y + 3.2) > pos.Y + 1.5 then
+		root.CFrame = CFrame.new(pos.X, ray.Position.Y + 3.2, pos.Z) * (root.CFrame - root.CFrame.Position)
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+		task.wait(0.25)
+	end
+end
+
 local function chop_tree(tree)
 	if not tree or not tree.Parent then return false, "tree gone" end
 	ensure_axe_for_chop()
 	attach(tree, true, true)
 	ensure_axe_for_chop()
+	settle_on_ground()
 
 	local char = plr.Character
 	local axeTool = nil
@@ -1337,6 +1339,15 @@ local function chop_tree(tree)
 
 	task.wait(0.6)
 	local isFelled = (not tree.Parent) or (tree:GetAttribute("State") == "Felled")
+
+	-- *never leave a session hanging: the server records a 'Rejected' infraction when
+	-- a session is abandoned mid-minigame, which is what escalates into AnticheatHop.
+	-- Cancel unconditionally if a session still exists after the loop ends.*
+	if ChopState.session() ~= nil then
+		pcall(function() ChopController:Cancel() end)
+		task.wait(0.15)
+	end
+
 	return isFelled, isFelled and "felled" or "held"
 end
 
@@ -1517,7 +1528,7 @@ local okTop, errTop = pcall(function()
 				if is_growing(t) then
 					safe_set(topLabel, ("camping %s — %s"):format(woodName, fmt_remaining(grow_remaining(t))))
 					task.spawn(function()
-						local okP, result = pcall(function()
+						local okP, felled, why = pcall(function()
 							local okTp, errTp = teleport_to(t:GetPivot().Position, Vector3.new(0, 1, 5))
 							if not okTp then
 								return false, errTp or "teleport blocked"
@@ -1537,15 +1548,10 @@ local okTop, errTop = pcall(function()
 							end
 							return chop_tree(t)
 						end)
-						local good, why = false, "threw"
-						if okP then
-							good, why = result, nil
-							if type(result) == "table" then good, why = true, nil end
-						end
-						if good then
+						if okP and felled then
 							safe_set(topLabel, ("sniped %s"):format(woodName))
 						else
-							safe_set(topLabel, ("fail: %s"):format(tostring(okP and why or result):sub(1, 22)))
+							safe_set(topLabel, ("fail: %s"):format(tostring(okP and why or felled):sub(1, 22)))
 						end
 						S.sniping = false
 					end)
@@ -1553,8 +1559,7 @@ local okTop, errTop = pcall(function()
 				end
 				safe_set(topLabel, "sniping " .. woodName .. "…")
 				task.spawn(function()
-					local good, result
-					local okP = pcall(function()
+					local okP, felled, why = pcall(function()
 						-- *pivot, not Trunk.Position: the trunk can sit high on a tall model,
 						-- which put us 15.4 studs out and past the 14-stud ReachStuds*
 						local okTp, errTp = teleport_to(t:GetPivot().Position, Vector3.new(0, 1, 5))
@@ -1564,10 +1569,10 @@ local okTop, errTop = pcall(function()
 						task.wait(0.4)
 						return chop_tree(t)
 					end)
-					if okP and good then
+					if okP and felled then
 						safe_set(topLabel, ("sniped %s"):format(woodName))
 					else
-						safe_set(topLabel, "fail: " .. tostring(okP and result or "chop threw"):sub(1, 18))
+						safe_set(topLabel, ("fail: %s"):format(tostring(okP and why or felled):sub(1, 20)))
 					end
 					S.sniping = false
 				end)
@@ -1620,7 +1625,6 @@ local panicLabel = gbFarm:CreateStatus({
 local axeLabel = gbSession:CreateStatus({Name = "Axe", Style = "Row", Value = "-"})
 local buckLabel = gbSession:CreateStatus({Name = "Bucks", Style = "Row", Value = "$0"})
 local sellLabel = gbSession:CreateLabel("off")
-local hopLabel = gbServer:CreateLabel("idle")
 local questLabel = gbQuest:CreateLabel("-")
 
 local buyLabel = gbAxes:CreateStatus({Name = "Auto buy", Style = "Row", Value = "off"})
@@ -2150,16 +2154,7 @@ gbSession:CreateButton({
 	end,
 })
 
-gbServer:CreateButton({
-	Name = "Hop to low server",
-	Callback = function()
-		task.spawn(function()
-			local msg = hop_to_low_server()
-			safe_set(hopLabel, msg)
-		end)
-	end,
-})
-gbServer:CreateLabel("server listed via games API")
+gbServer:CreateLabel("no auto-hop: stay on this server")
 
 local function claim_all_quests()
 	local RS = game:GetService("ReplicatedStorage")
