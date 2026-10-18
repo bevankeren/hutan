@@ -69,26 +69,38 @@ entry[n] = {"S", hit[n], "A", 0}
 For the Secret tune: `Approach 0.3874`, `Recover 0.02`, `K 0.2712`.
 Perfect window is `2 * tune.Perfect * Approach` = 21.45 ms.
 
-## Status: not yet accepted
+## Status: the Captain got the tree
 
-Sending the log with 45 paced `ChopStrike` fires and then
-`FinishChop(tree, true, true, log)` returns **"That chop didn't go through"**.
+After the capture above, the Captain ran it and **the tree was felled** — a Secret
+`MoonwellBaobab` dropped. So the mechanics are real and the approach works.
 
-Two mismatches identified from the capture and not yet tested together:
+What is *not* established is which of the two corrections was decisive:
 
-1. **Arg 3 must be `false`.** Sending `true` claims a perfect run.
+1. **Arg 3 must be `false`.** Sending `true` claims a perfect run, which the log has
+   to back up. The real client sends `false`.
 2. **`wallSinceOpen` must track real time since `StartChop`**, not since the strike
    loop began. The loop starts ~800 ms after the session opens, so every wall value
-   was short by that much, and the pair `(elapsed, wall)` no longer resembled what a
-   real client produces.
+   was short by that much and the pair `(elapsed, wall)` stopped resembling a real
+   client's output.
 
-Both are corrected in the next attempt. The tree that was targeted got felled by
-another player before the retest, so it is untested as of this note.
+Both were changed together, so the successful run does not isolate them. Isolating
+them is cheap and worth doing before this becomes a shipped feature: send `false` with
+the *old* (unfixed) wall clock, and if that alone passes, the wall-clock correction is
+unnecessary.
 
-## Fallback if it stays rejected
+I could not confirm the run directly — the connector was down and the newest Roblox
+log predates the attempt — so the above is the Captain's report, not a measurement.
 
-The server also enforces `MinDuration` (6.64 s for this Secret) in real time, so there
-is no true instant path — the shortest possible chop is `MinDuration` regardless. If
-the log replay will not pass, the remaining option is driving the real minigame
-accurately: read the ring, derive the simulation clock from it, and fire on that
-clock rather than on wall time.
+## MinDuration is a hard floor
+
+The server enforces `MinDuration` (6.64 s for this Secret) in real time, so no chop is
+truly instant. The shortest possible is `MinDuration`; what the log replay removes is
+the *difficulty* of the minigame, not the clock.
+
+## Fallback if it regresses
+
+If the server starts rejecting again, the remaining option is driving the real
+minigame accurately: read the ring, derive the simulation clock from it, and fire on
+that clock rather than on wall time. `MaxStep` clamping means wall time and sim time
+diverge whenever a frame exceeds 50 ms, which is exactly what happens on the PC.
+
