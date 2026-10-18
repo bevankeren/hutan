@@ -817,6 +817,27 @@ Job   : 14baa559-5036-4063-8087-ea3fdd422ae2
 - `Get-ChildItem -Name` hanya menampilkan 5 file: `.gitignore`, `farm_hub.lua`, `farm_hub_src.lua`, `history.md`, `rules.md`.
 - File yang dihapus di-commit ke Git dan di-push ke GitHub.
 
+---
+
+## 2026-10-18 19:46:00 +07:00 — penambahan tab Discord dan Changelog di bawah tab Home
+
+Game  : Foresters 🌳 [RELEASE]
+Place : 117020342702668
+Client: 0.743.0.7431134
+Job   : 14baa559-5036-4063-8087-ea3fdd422ae2
+
+### Perubahan
+- Menambahkan tab baru `Discord` di bawah tab `Home` (sebelum tab `Farm`).
+- Menambahkan Groupbox `Discord` di sisi kiri dengan input link undangan `https://discord.gg/C56zw6khS8` serta tombol `Copy Discord Link` yang didukung multi-executor clipboard fallback (`setclipboard`, `toclipboard`, `syn.write_clipboard`).
+- Menambahkan Groupbox `Changelog` di sisi kanan dengan placeholder kosong (`—`) sesuai instruksi.
+
+### Alasan
+- Permintaan Captain: "dibawah tab home buat tab discord, link discordnya https://discord.gg/C56zw6khS8 , nanti bs di copy. dan ada changelog tp kosongina ja changelognya".
+
+### Bukti
+- Perubahan diimplementasikan pada source code [farm_hub_src.lua](file:///c:/Users/bevan/OneDrive/Documents/ChatGPT/foresters/farm_hub_src.lua).
+- Siap untuk diobfuskasi ulang atau di-deploy.
+
 
 
 
