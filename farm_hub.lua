@@ -2248,6 +2248,7 @@ do
 end
 
 local farmTab = Window:CreateTab({Name = "Farm", Icon = "tree-pine"})
+local levelingTab = Window:CreateTab({Name = "Leveling", Icon = "trending-up"})
 local teleportTab = Window:CreateTab({Name = "Teleport", Icon = "map-pin"})
 local axeTab = Window:CreateTab({Name = "Axes", Icon = "axe"})
 local visualTab = Window:CreateTab({Name = "Visual", Icon = "eye"})
@@ -3045,6 +3046,402 @@ gbAxes:CreateButton({
 		end)
 	end,
 })
+
+do
+	local gbLevelControls = levelingTab:CreateGroupbox({Name = "Leveling Autofarm", Side = "Left"})
+	local gbLevelStatus = levelingTab:CreateGroupbox({Name = "Status & Target", Side = "Right"})
+
+	local REDWOOD_BOUNDS = {minX = -220, maxX = 220, minZ = -1450, maxZ = -700}
+	local REDWOOD_SPAWN = Vector3.new(2, 5, -1051)
+
+	local function is_in_redwood(pos)
+		if not pos then return false end
+		return pos.X >= REDWOOD_BOUNDS.minX and pos.X <= REDWOOD_BOUNDS.maxX and pos.Z >= REDWOOD_BOUNDS.minZ and pos.Z <= REDWOOD_BOUNDS.maxZ
+	end
+
+	local levelStateLabel = gbLevelStatus:CreateStatus({Name = "State", Style = "Dot", Value = "idle"})
+	local levelTargetLabel = gbLevelStatus:CreateLabel("target: -")
+	local levelFelledLabel = gbLevelStatus:CreateStatus({Name = "Chopped", Style = "Row", Value = "0 trees"})
+	local levelRateLabel = gbLevelStatus:CreateStatus({Name = "Rate", Style = "Row", Value = "0/min"})
+
+	local felledCount = 0
+	local startTime = 0
+	local levelSpeed = 24
+	local autoLevelingToggle = nil
+
+	local function update_stats()
+		levelFelledLabel:Set(tostring(felledCount) .. " trees")
+		if startTime > 0 and felledCount > 0 then
+			local mins = (os.clock() - startTime) / 60
+			if mins > 0.05 then
+				local rate = math.floor(felledCount / mins + 0.5)
+				levelRateLabel:Set(tostring(rate) .. "/min")
+			end
+		end
+	end
+
+	local function smart_walk(targetPos, speed, stopDist)
+		local char = plr.Character
+		local root = char and char:FindFirstChild("HumanoidRootPart")
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		if not (root and hum) then return false, "no character" end
+
+		speed = speed or 24
+		stopDist = stopDist or 6.5
+		hum.WalkSpeed = speed
+
+		local dist = (targetPos - root.Position).Magnitude
+		if dist <= stopDist then return true end
+
+		local pf = game:GetService("PathfindingService")
+		local path = pf:CreatePath({
+			AgentRadius = 2.0,
+			AgentHeight = 5.0,
+			AgentCanJump = true,
+			AgentJumpHeight = 7.5,
+			AgentMaxSlope = 60,
+			WaypointSpacing = 5,
+		})
+
+		local computed = false
+		for _ = 1, 2 do
+			local okC = pcall(function() path:ComputeAsync(root.Position, targetPos) end)
+			if okC and path.Status == Enum.PathStatus.Success then
+				computed = true
+				break
+			end
+			task.wait(0.15)
+		end
+
+		if not computed then
+			hum:MoveTo(targetPos)
+			local t0 = os.clock()
+			while os.clock() - t0 < 3.5 do
+				if not alive() or not S.levelingOn then return false end
+				if (root.Position - targetPos).Magnitude <= stopDist then return true end
+				task.wait(0.1)
+			end
+			return (root.Position - targetPos).Magnitude <= stopDist + 2.5
+		end
+
+		local waypoints = path:GetWaypoints()
+		local i = 2
+		local lastPos = root.Position
+		local stall = 0
+
+		while i <= #waypoints do
+			if not alive() or not S.levelingOn then return false end
+			local wp = waypoints[i]
+			if wp.Action == Enum.PathWaypointAction.Jump then
+				pcall(function() hum.Jump = true end)
+			end
+			hum:MoveTo(wp.Position)
+
+			local tWp = os.clock()
+			while os.clock() - tWp < 1.2 do
+				if not alive() or not S.levelingOn then return false end
+				task.wait(0.04)
+				local curPos = root.Position
+				if (curPos - targetPos).Magnitude <= stopDist then
+					return true
+				end
+				if (curPos - wp.Position).Magnitude <= 3.5 then
+					break
+				end
+				if (curPos - lastPos).Magnitude < 0.25 then
+					stall += 1
+					if stall >= 8 then
+						pcall(function() hum.Jump = true end)
+						stall = 0
+					end
+				else
+					stall = 0
+					lastPos = curPos
+				end
+			end
+			i += 1
+		end
+
+		hum:MoveTo(targetPos)
+		local tEnd = os.clock()
+		while os.clock() - tEnd < 1.8 do
+			if (root.Position - targetPos).Magnitude <= stopDist then return true end
+			task.wait(0.08)
+		end
+		return (root.Position - targetPos).Magnitude <= stopDist + 2.5
+	end
+
+	local function leveling_chop(tree)
+		if not tree or not tree.Parent then return false, "tree gone" end
+		ensure_axe_for_chop()
+		settle_on_ground()
+
+		local char = plr.Character
+		local axeTool = nil
+		if char then
+			for _, c in ipairs(char:GetChildren()) do
+				if c:IsA("Tool") and c.Name:match("Axe") then axeTool = c break end
+			end
+		end
+		if not axeTool then return false, "no axe equipped" end
+
+		local okCC, ChopController = pcall(function() return Knit.GetController("ChopController") end)
+		local okCS, ChopState = pcall(function() return require(plr.PlayerScripts.Source.state.ChopState) end)
+		local GuiService = game:GetService("GuiService")
+		if not (okCC and okCS and ChopController and ChopState) then
+			return false, "controllers missing"
+		end
+
+		local animConn = nil
+		local hum = char:FindFirstChildOfClass("Humanoid")
+		local animator = hum and hum:FindFirstChildOfClass("Animator")
+		if animator then
+			for _, t in ipairs(animator:GetPlayingAnimationTracks()) do
+				local tn = t.Name:lower()
+				if tn:match("axe") or tn:match("swing") or tn:match("chop") or tn:match("windup") then
+					t:Stop(0)
+				end
+			end
+			animConn = animator.AnimationPlayed:Connect(function(track)
+				local tn = track.Name:lower()
+				if tn:match("axe") or tn:match("swing") or tn:match("chop") or tn:match("windup") then
+					task.defer(function() track:Stop(0) end)
+				end
+			end)
+		end
+
+		local trunk = tree:FindFirstChild("Trunk") or tree.PrimaryPart or tree:GetPivot()
+		local trunkPos = trunk.Position
+		local cam = workspace.CurrentCamera
+		if cam then
+			cam.CFrame = CFrame.lookAt(cam.CFrame.Position, trunkPos)
+		end
+		task.wait(0.05)
+		local vp = cam and cam:WorldToViewportPoint(trunkPos) or Vector3.new(200, 200, 0)
+		local screenPos = Vector2.new(vp.X, vp.Y) - GuiService:GetGuiInset()
+
+		ChopController:BeginWindup(axeTool, screenPos)
+		local fillSec = (ChopTuning and tonumber(ChopTuning.WindupFillSeconds)) or 0.65
+		task.wait(fillSec)
+		ChopController:ReleaseWindup()
+
+		local sessionStarted = false
+		for _ = 1, 30 do
+			if not alive() or not S.levelingOn then
+				pcall(function() ChopController:Cancel() end)
+				if animConn then pcall(function() animConn:Disconnect() end) end
+				return false, "cancelled"
+			end
+			if ChopState.session() ~= nil then
+				sessionStarted = true
+				break
+			end
+			task.wait(0.05)
+		end
+
+		if not sessionStarted then
+			pcall(function() ChopController:Cancel() end)
+			if animConn then pcall(function() animConn:Disconnect() end) end
+			return false, "session failed to start"
+		end
+
+		local t0 = os.clock()
+		local maxDuration = 15
+		local session = ChopState.session()
+		if session and session.Params and session.Params.MinDuration then
+			maxDuration = math.max(10, session.Params.MinDuration + 5)
+		end
+
+		while os.clock() - t0 < maxDuration and ChopState.session() ~= nil do
+			if not alive() or not S.levelingOn then
+				pcall(function() ChopController:Cancel() end)
+				if animConn then pcall(function() animConn:Disconnect() end) end
+				return false, "cancelled"
+			end
+			local rw = plr.PlayerGui:FindFirstChild("ReactWorld")
+			if rw then
+				for _, dot in ipairs(rw:GetChildren()) do
+					if dot.Name:match("Dot") then
+						local hitBtn = dot:FindFirstChild("Hit", true)
+						local ring = dot:FindFirstChild("Area", true) and dot.Area:FindFirstChild("Ring", true)
+						local stroke = ring and ring:FindFirstChild("Square", true) and ring.Square:FindFirstChild("Ring", true) and ring.Square.Ring:FindFirstChild("Stroke", true)
+						if hitBtn and stroke then
+							local c = stroke.Color
+							if c.G > 0.8 and c.R < 0.75 then
+								local fakeInput = {
+									UserInputType = Enum.UserInputType.MouseButton1,
+									Position = Vector3.new(hitBtn.AbsolutePosition.X, hitBtn.AbsolutePosition.Y, 0)
+								}
+								pcall(function() firesignal(hitBtn.InputBegan, fakeInput, false) end)
+								task.wait(0.04)
+								break
+							end
+						end
+					end
+				end
+			end
+			if (not tree.Parent) or (tree:GetAttribute("State") == "Felled") then
+				break
+			end
+			task.wait(0.015)
+		end
+
+		task.wait(0.3)
+		if animConn then pcall(function() animConn:Disconnect() end) end
+		local isFelled = (not tree.Parent) or (tree:GetAttribute("State") == "Felled")
+		if ChopState.session() ~= nil then
+			pcall(function() ChopController:Cancel() end)
+			task.wait(0.1)
+		end
+		return isFelled, isFelled and "felled" or "held"
+	end
+
+	local function get_best_redwood_tree()
+		local myRoot = hrp()
+		if not myRoot then return nil end
+		local myPos = myRoot.Position
+		local trees = workspace.Map:FindFirstChild("Trees")
+		if not trees then return nil end
+
+		local candidates = {}
+		for _, t in ipairs(trees:GetChildren()) do
+			if is_live(t) and not is_growing(t) then
+				local tp = t:GetPivot().Position
+				if is_in_redwood(tp) then
+					local d = (tp - myPos).Magnitude
+					local score, money, odds = top_score(t)
+					local travelSec = d / math.max(levelSpeed, 16)
+					local efficiency = score / (1 + travelSec * 0.1)
+					table.insert(candidates, {tree = t, dist = d, eff = efficiency, name = t.Name})
+				end
+			end
+		end
+		if #candidates == 0 then return nil end
+		table.sort(candidates, function(a, b) return a.eff > b.eff end)
+		return candidates[1].tree, candidates[1]
+	end
+
+	local function start_leveling_loop()
+		task.spawn(function()
+			startTime = os.clock()
+			felledCount = 0
+			update_stats()
+
+			while S.levelingOn and alive() do
+				local myRoot = hrp()
+				if not myRoot then
+					levelStateLabel:Set("no char", "Warning")
+					task.wait(0.5)
+					continue
+				end
+
+				if not is_in_redwood(myRoot.Position) then
+					S.levelingOn = false
+					if autoLevelingToggle then
+						pcall(function() autoLevelingToggle:Set(false) end)
+					end
+					levelStateLabel:Set("outside redwood", "Error")
+					levelTargetLabel:Set("Must be in Redwood Grove!")
+					Window:Notify({
+						Title = "Leveling Farm",
+						Content = "Auto Leveling stopped: You are outside Redwood Grove! Teleport there first.",
+						Duration = 4,
+					})
+					break
+				end
+
+				local target, info = get_best_redwood_tree()
+				if not target then
+					levelStateLabel:Set("scanning trees", "Warning")
+					levelTargetLabel:Set("no ready redwood tree")
+					task.wait(2)
+					continue
+				end
+
+				local standPos = get_tree_stand(target, myRoot.Position, false)
+				levelTargetLabel:Set(tostring(info.name) .. " (" .. tostring(math.floor(info.dist)) .. "m)")
+				levelStateLabel:Set("walking", "Warning")
+
+				local reached = smart_walk(standPos, levelSpeed, 7.5)
+				if not S.levelingOn or not alive() then break end
+
+				if reached and target.Parent and is_live(target) then
+					levelStateLabel:Set("chopping", "Success")
+					local felled, why = leveling_chop(target)
+					if felled then
+						felledCount += 1
+						update_stats()
+					end
+				end
+
+				task.wait(0.2)
+			end
+
+			levelStateLabel:Set("idle", "Muted")
+			levelTargetLabel:Set("-")
+		end)
+	end
+
+	autoLevelingToggle = gbLevelControls:CreateToggle({
+		Name = "Auto Leveling (Redwood Only)",
+		Flag = "AutoLevelingRedwood",
+		CurrentValue = false,
+		Callback = function(val)
+			if val then
+				local myRoot = hrp()
+				if not myRoot or not is_in_redwood(myRoot.Position) then
+					task.defer(function()
+						if autoLevelingToggle then pcall(function() autoLevelingToggle:Set(false) end) end
+					end)
+					levelStateLabel:Set("outside redwood", "Error")
+					levelTargetLabel:Set("Must be in Redwood Grove!")
+					Window:Notify({
+						Title = "Leveling Farm",
+						Content = "Cannot start: You must be inside Redwood Grove!",
+						Duration = 4,
+					})
+					return
+				end
+				S.levelingOn = true
+				start_leveling_loop()
+			else
+				S.levelingOn = false
+			end
+		end,
+	})
+
+	gbLevelControls:CreateSlider({
+		Name = "Walk Speed",
+		Flag = "LevelingWalkSpeed",
+		Range = {16, 28},
+		Increment = 1,
+		CurrentValue = 24,
+		Callback = function(val)
+			levelSpeed = tonumber(val) or 24
+		end,
+	})
+
+	gbLevelControls:CreateButton({
+		Name = "Teleport to Redwood Grove",
+		Callback = function()
+			task.spawn(function()
+				levelStateLabel:Set("teleporting...", "Warning")
+				local ok, err = WALK.respawnJump(REDWOOD_SPAWN)
+				if ok then
+					levelStateLabel:Set("arrived at redwood", "Success")
+					levelTargetLabel:Set("Ready to farm!")
+				else
+					levelStateLabel:Set("tp failed", "Error")
+				end
+			end)
+		end,
+	})
+
+	gbLevelControls:CreateParagraph({
+		Title = "Redwood Leveling Specs",
+		Content = "Exclusively targets high-XP Redwood trees. Walks via legit Smart Pathfinding (no noclip, collision ON). Chopping runs with muted swing animations for maximum time efficiency.",
+	})
+end
 
 do
 	local gbTeleportArea = teleportTab:CreateGroupbox({Name = "Islands & Areas", Side = "Left"})
