@@ -417,3 +417,55 @@ Job   : 7a6319da-4785-44a7-9556-5da63e8ff7df
 - Jangan pakai `PivotTo` untuk bike; server menolaknya.
 - Jangan simpan referensi model bike — model diganti/dihapus saat respawn.
   Cari ulang lewat set difference pada `workspace.Bikes`.
+
+---
+
+## 2026-10-18 17:22:00 +07:00 — bike TP: chassis CFrame adalah celah yang benar
+
+Game  : Foresters 🌳 [RELEASE]
+Place : 117020342702668
+Client: 0.743.0.7431134
+Job   : 7a6319da-4785-44a7-9556-5da63e8ff7df
+
+### Perubahan
+- Tidak ada kode hub yang diubah. Lanjutan investigasi.
+
+### Alasan
+- `PivotTo` ditolak dan thrust kecepatan di-clamp; perlu jalur ketiga.
+
+### Bukti — jalur yang BEKERJA
+- `bike:PivotTo()` → DITOLAK, bike balik dalam 0,2 detik.
+- `AssemblyLinearVelocity` → DI-CLAMP game, bukan ditolak server:
+  ```
+  v=120  moved=26  settled=27  pullback=2
+  v=200  moved=16  settled=16  pullback=1
+  v=280  moved=2   settled=2   pullback=0
+  ```
+  Makin tinggi justru makin pendek. Kecepatan bike dibatasi di sisi game.
+- **`chassis.CFrame = chassis.CFrame + offset` → DITERIMA.**
+  Lompatan 66 stud bertahan 2 detik penuh tanpa snapback:
+  ```
+  0.2s human_d=14 bike_d=15
+  1.0s human_d=15 bike_d=15
+  2.0s human_d=15 bike_d=15
+  ```
+  `health = 100`, JobId tidak berubah.
+- Kenapa: karakter menempel ke chassis lewat weld, jadi memindahkan chassis
+  ikut memindahkan penunggang. Frame model bukan target yang divalidasi.
+
+### Bukti — yang GAGAL
+- Lompatan 430 stud lewat chassis CFrame → koneksi putus.
+- Log: dua `Player: 285 (DisconnectClientInitiated)` pada 10:15:29 dan
+  10:18:41 UTC.
+
+### Kesimpulan
+- Celahnya nyata dan sudah terbukti sampai 66 stud tanpa koreksi.
+- Batas aman belum ketemu; di antara 66 dan 430 stud.
+- Langkah berikutnya: uji berjenjang 100 / 150 / 200 / 250 stud, satu lompatan
+  per sesi, catat mana yang bertahan. Jangan lompat langsung ke ratusan.
+
+### Catatan penting
+- Klaim awal bahwa "PivotTo saat mounting yang bikin kick" **tidak terbukti**.
+  Semua disconnect memakai kode 285 yang sama dan kode itu juga muncul tanpa
+  aktivitas apa pun. Jangan simpulkan anticheat sebelum ada `Banned` atau pesan
+  kick beralasan.
