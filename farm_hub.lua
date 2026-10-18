@@ -261,6 +261,23 @@ function WALK.noclip(state)
 	for _, p in ipairs(char:GetDescendants()) do
 		if p:IsA("BasePart") then pcall(function() p.CanCollide = state end) end
 	end
+	-- *when re-enabling, also make sure the humanoid's ground states are on. The hub's
+	-- own noclip_pass turns Landed/FallingDown off, and a humanoid with those disabled
+	-- can never stand up again — it loops FallingDown -> GettingUp forever.*
+	if state then
+		local hum = char:FindFirstChildOfClass("Humanoid")
+		if hum then
+			for _, st in ipairs({
+				Enum.HumanoidStateType.Landed,
+				Enum.HumanoidStateType.FallingDown,
+				Enum.HumanoidStateType.Ragdoll,
+				Enum.HumanoidStateType.PlatformStanding,
+			}) do
+				pcall(function() hum:SetStateEnabled(st, true) end)
+			end
+			pcall(function() hum.AutoRotate = true end)
+		end
+	end
 end
 
 -- *shed decorative layers during a long walk: on a 2 GB card the streaming queue is
@@ -289,6 +306,27 @@ function WALK.unstrip()
 	WALK.stripped = nil
 end
 
+-- *stand the character upright before walking.
+--
+-- A knocked-over character sits in FallingDown/GettingUp forever and MoveTo does
+-- nothing — measured: WalkSpeed 48 but only 1.9 studs/s of drift while the root's
+-- UpVector pointed sideways. Straightening the root and forcing GettingUp restores
+-- normal locomotion immediately (verified: 37 studs/s right after).*
+function WALK.stand()
+	local char = plr.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not (root and hum) then return end
+	if root.CFrame.UpVector.Y > 0.85 then return end
+
+	local p = root.Position
+	root.CFrame = CFrame.new(p.X, p.Y + 2.5, p.Z)
+	root.AssemblyLinearVelocity = Vector3.zero
+	root.AssemblyAngularVelocity = Vector3.zero
+	pcall(function() hum:ChangeState(Enum.HumanoidStateType.GettingUp) end)
+	task.wait(0.5)
+end
+
 -- *one leg of the trip: MoveTo a point and wait until the humanoid reports arrival,
 -- or until it stops making progress. Returns true on arrival.
 --
@@ -301,6 +339,12 @@ function WALK.leg(target, speed)
 	local hum = char and char:FindFirstChildOfClass("Humanoid")
 	if not (root and hum) then return false end
 
+	WALK.stand()
+	-- *collision must stay off for the whole leg. The game's own controllers and our
+	-- restore_collide() both flip CanCollide back on, and a single re-enabled frame is
+	-- enough to wedge the character against a rock — measured: MoveDirection 0 while
+	-- WalkToPoint sat 150 studs away.*
+	WALK.noclip(false)
 	pcall(function() hum.WalkSpeed = speed end)
 	pcall(function() hum:MoveTo(target) end)
 
@@ -311,6 +355,8 @@ function WALK.leg(target, speed)
 	while os.clock() < deadline do
 		if not alive() then return false end
 		task.wait(0.1)
+		-- *re-assert noclip every tick: something in this game re-enables it*
+		WALK.noclip(false)
 		local now = root.Position
 		local moved = (now - lastPos).Magnitude
 		lastPos = now
@@ -339,6 +385,7 @@ function WALK.go(dest)
 	local speed = math.clamp(tonumber(S.walkSpeed) or 32, 16, 120)
 	local strip = S.walkStripMap ~= false
 
+	WALK.stand()
 	if strip then WALK.strip() end
 	WALK.noclip(false)
 
