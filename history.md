@@ -469,3 +469,67 @@ Job   : 7a6319da-4785-44a7-9556-5da63e8ff7df
   Semua disconnect memakai kode 285 yang sama dan kode itu juga muncul tanpa
   aktivitas apa pun. Jangan simpulkan anticheat sebelum ada `Banned` atau pesan
   kick beralasan.
+
+---
+
+## 2026-10-18 17:22:16 +07:00 — koreksi metode: TP saat MAU NAIK, bukan setelah duduk
+
+Game  : Foresters 🌳 [RELEASE]
+Place : 117020342702668
+Client: 0.743.0.7431134
+Job   : a9181420-1ccb-4777-8c12-89c345405099
+
+### Perubahan
+- Tidak ada kode hub yang diubah. Koreksi arah riset dari Captain.
+
+### Alasan
+- Captain mengoreksi: TP harus dilakukan **saat mau naik bike**, bukan setelah
+  sudah duduk. Selama ini pengujian menunggu weld jadi (`seat.Occupant == hum`)
+  dulu baru teleport — itu justru kondisi yang paling terkunci.
+
+### Bukti — urutan yang dicoba
+1. **TP karakter lalu langsung sit** (char move → sit):
+   ```
+   0.25s d=5
+   0.50s d=5
+   0.75s d=77   <- ditarik balik
+   ```
+   Bertahan ~0,75 detik, lalu dikoreksi.
+
+2. **Sit dulu lalu gerakkan karakter** (sit → char move tiap 20ms):
+   ```
+   t=0.00 sit issued, sit=false
+   t=0.02 root set, occupant=false
+   t=0.04 root set, occupant=true    <- mount selesai di 40ms
+   0.25s d=3
+   0.50s d=78   <- ditarik balik ke kursi
+   ```
+   Mount selesai dalam 40 ms, karakter sempat di target (d=3), lalu ditarik ke
+   posisi kursi. Sebabnya jelas: **kursinya tidak ikut pindah**, jadi karakter
+   ditarik ke kursi yang masih di tempat lama.
+
+### Bukti — disconnect
+- `Player: 285 (DisconnectClientInitiated)` lagi pada 10:21:31 UTC.
+- Total tiga kali hari ini: 10:15:29, 10:18:41, 10:21:31.
+- Tidak ada `Banned`, tidak ada pesan kick beralasan di log mana pun.
+
+### Yang dipelajari
+- Jendela mount itu **sangat pendek**: mount selesai ~40 ms setelah `Sit`
+  dipanggil. Menunggu weld jadi = melewati jendelanya sepenuhnya.
+- Yang harus dipindah **bukan karakter, tapi kursi/bike-nya**, karena setelah
+  mount server mengikat posisi karakter ke kursi. Memindahkan karakter saja
+  selalu berakhir ditarik balik.
+- `seat.CFrame` dan `chassis.CFrame` sama-sama jalur yang perlu dicoba
+  bersamaan dengan mount, bergantian, bukan berurutan menunggu.
+
+### Langkah berikutnya (belum dijalankan)
+- Sit dipanggil, lalu dalam <40 ms pindahkan `chassis`/`seat` CFrame, diulang
+  tiap tick selama ~200 ms. Kombinasi ini belum pernah dites; percobaan
+  terakhir putus sebelum selesai.
+
+### Catatan lingkungan
+- `hum.Sit` bisa nyangkut `true` setelah lompatan gagal, dan selama itu SEMUA
+  tool ditolak dipasang (kapak juga). Pelepasnya:
+  `hum:ChangeState(Enum.HumanoidStateType.GettingUp)`.
+- Bike tool tidak bisa dipasang lewat `Humanoid:EquipTool` selama duduk; harus
+  berdiri dulu.
