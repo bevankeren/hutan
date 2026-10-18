@@ -794,6 +794,29 @@ Job   : 14baa559-5036-4063-8087-ea3fdd422ae2
 - Source lokal tersimpan aman di `farm_hub_src.lua`.
 - Berhasil di-push ke GitHub `origin/main`.
 
+---
+
+## 2026-10-18 19:28:00 +07:00 — pembersihan total file usang (hanya menyisakan rules, history, dan farm hub)
+
+Game  : Foresters 🌳 [RELEASE]
+Place : 117020342702668
+Client: 0.743.0.7431134
+Job   : 14baa559-5036-4063-8087-ea3fdd422ae2
+
+### Perubahan
+- Menghapus seluruh file eksperimen lama, modul probe diagnostic, markdown analisis terdahulu, skrip testing harga, skrip autofarm legacy, dan folder `_ui_ref` dari git tracking dan disk lokal:
+  - Markdown: `CONNECTOR_PHONE.md`, `INSTANT_CHOP.md`, `OUROBOROS_ANALYSIS.md`, `README_LEGIT.md`, `RESPAWN_TP_BYPASS.md`, `SOAK_TEST_LOG.md`.
+  - Skrip testing: `autofarm.lua`, `axe_probe.lua`, `blizzard_hub.lua`, `connector_pc.luau`, `connector_phone.luau`, `farm_ui.lua`, `instant_chop.lua`, `mini_test.lua`, `saw_probe.lua`, `test_price_v2.lua` s/d `test_price_v6.lua`.
+  - Folder/Submodule: `_ui_ref`.
+- Menyisakan hanya file kerja inti: `rules.md`, `history.md`, `farm_hub.lua` (build rilis GitHub), `.gitignore`, serta `farm_hub_src.lua` (source code asli non-obfuskasi untuk pengembangan lokal).
+
+### Alasan
+- Permintaan Captain: "btw yg di folder ini udh ga kepake apus aja, kita cuma pake rules history ama farm hub doang kan".
+
+### Bukti
+- `Get-ChildItem -Name` hanya menampilkan 5 file: `.gitignore`, `farm_hub.lua`, `farm_hub_src.lua`, `history.md`, `rules.md`.
+- File yang dihapus di-commit ke Git dan di-push ke GitHub.
+
 
 
 
