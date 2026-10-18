@@ -2248,6 +2248,7 @@ do
 end
 
 local farmTab = Window:CreateTab({Name = "Farm", Icon = "tree-pine"})
+local teleportTab = Window:CreateTab({Name = "Teleport", Icon = "map-pin"})
 local axeTab = Window:CreateTab({Name = "Axes", Icon = "axe"})
 local visualTab = Window:CreateTab({Name = "Visual", Icon = "eye"})
 local panicTab = Window:CreateTab({Name = "Panic", Icon = "shield-alert"})
@@ -2260,7 +2261,6 @@ local gbMove = farmTab:CreateGroupbox({Name = "Movement", Side = "Right"})
 
 local gbAxes = axeTab:CreateGroupbox({Name = "Shop", Side = "Left"})
 local gbLadder = axeTab:CreateGroupbox({Name = "Buy ladder", Side = "Right"})
-local gbUtil = axeTab:CreateGroupbox({Name = "Utilities", Side = "Left"})
 
 local gbVisualPerf = visualTab:CreateGroupbox({Name = "Performance", Side = "Left"})
 local gbEsp = visualTab:CreateGroupbox({Name = "Overlay", Side = "Left"})
@@ -2419,7 +2419,6 @@ gbAxes:CreateStatus({
 		return "ladder complete", "Success"
 	end,
 })
-local mikuLabel = gbUtil:CreateLabel("miku: not scanned yet")
 
 local panicLabel = gbPanicStatus:CreateStatus({
 	Name = "Nearest",
@@ -3047,48 +3046,139 @@ gbAxes:CreateButton({
 	end,
 })
 
-local function find_miku()
-	local map = workspace:FindFirstChild("Map")
-	local npcs = map and map:FindFirstChild("NPCs")
-	if npcs then
-		local m = npcs:FindFirstChild("Merchant")
-		if m and m:IsA("Model") then
-			local root = m:FindFirstChild("HumanoidRootPart")
-			if root then return root.Position, "Miku (travelling merchant)" end
-			local ok, pos = pcall(function() return m:GetPivot().Position end)
-			if ok and pos then return pos, "Miku (travelling merchant)" end
-		end
-	end
-	local wanderer = map and map:FindFirstChild("Wanderer")
-	if wanderer and wanderer:IsA("Model") then
-		local root = wanderer:FindFirstChild("HumanoidRootPart")
-		if root then return root.Position, "Wanderer" end
-		local ok, pos = pcall(function() return wanderer:GetPivot().Position end)
-		if ok and pos then return pos, "Wanderer" end
-	end
-	for _, p in ipairs(game.Players:GetPlayers()) do
-		if p ~= plr and (string.lower(p.Name):match("miku") or string.lower(p.DisplayName):match("miku")) then
-			local root = p.Character and p.Character:FindFirstChild("HumanoidRootPart")
-			if root then return root.Position, "player " .. p.Name end
-		end
-	end
-	return nil, nil
-end
+do
+	local gbTeleportArea = teleportTab:CreateGroupbox({Name = "Islands & Areas", Side = "Left"})
+	local gbTeleportNPC = teleportTab:CreateGroupbox({Name = "NPCs & Merchants", Side = "Right"})
 
-gbUtil:CreateButton({
-	Name = "TP to Miku",
-	Callback = function()
-		task.spawn(function()
+	local TELEPORT_AREAS = {
+		{name = "Oak Island (Spawn)", folder = "OakIsland", pos = Vector3.new(-98, 24, -558)},
+		{name = "Birch Island", folder = "BirchIsland", pos = Vector3.new(645, 4, -591)},
+		{name = "Crescent Island", folder = "CrescentIsland", pos = Vector3.new(182, 9, -44)},
+		{name = "Snowy Pines", folder = "SnowyPines", pos = Vector3.new(1241, 10, -580)},
+		{name = "Dusty Mesa", folder = "DustyMesa", pos = Vector3.new(-541, 8, 310)},
+		{name = "Redwood Grove", folder = "RedwoodGrove", pos = Vector3.new(2, 5, -1051)},
+		{name = "Orchard Island", folder = "OrchardIsland", pos = Vector3.new(-560, 15, -541)},
+		{name = "Merchant Camp", folder = "MerchantCamp", pos = Vector3.new(207, 4, -126)},
+	}
+
+	local function get_area_pos(areaName)
+		local map = workspace:FindFirstChild("Map")
+		for _, a in ipairs(TELEPORT_AREAS) do
+			if a.name == areaName then
+				if map then
+					local f = map:FindFirstChild(a.folder)
+					if f then
+						local tp = f:FindFirstChild("TeleportPoint")
+						if tp and tp:IsA("BasePart") then
+							return tp.Position
+						elseif f:IsA("Model") then
+							local ok, p = pcall(function() return f:GetPivot().Position end)
+							if ok and p then return p end
+						end
+					end
+				end
+				return a.pos
+			end
+		end
+		return nil
+	end
+
+	local AREA_OPTIONS = {}
+	for _, a in ipairs(TELEPORT_AREAS) do
+		table.insert(AREA_OPTIONS, a.name)
+	end
+
+	local selectedArea = AREA_OPTIONS[1]
+	local areaStatusLabel = gbTeleportArea:CreateLabel("status: idle")
+
+	gbTeleportArea:CreateDropdown({
+		Name = "Select Destination",
+		Flag = "TeleportDestination",
+		Options = AREA_OPTIONS,
+		CurrentOption = selectedArea,
+		Callback = function(sel)
+			selectedArea = sel
+		end,
+	})
+
+	gbTeleportArea:CreateButton({
+		Name = "Teleport to Area",
+		Callback = function()
+			task.spawn(function()
+				local destPos = get_area_pos(selectedArea)
+				if not destPos then
+					areaStatusLabel:Set("status: area not found")
+					return
+				end
+				areaStatusLabel:Set("status: teleporting to " .. tostring(selectedArea) .. "…")
+				local ok, err = WALK.respawnJump(destPos)
+				if ok then
+					areaStatusLabel:Set("status: arrived at " .. tostring(selectedArea))
+				else
+					areaStatusLabel:Set("status: tp failed (" .. tostring(err or "err") .. ")")
+				end
+			end)
+		end,
+	})
+
+	local mikuLabel = gbTeleportNPC:CreateLabel("miku: not scanned yet")
+
+	local function find_miku()
+		local map = workspace:FindFirstChild("Map")
+		local npcs = map and map:FindFirstChild("NPCs")
+		if npcs then
+			local m = npcs:FindFirstChild("Merchant")
+			if m and m:IsA("Model") then
+				local root = m:FindFirstChild("HumanoidRootPart")
+				if root then return root.Position, "Miku (travelling merchant)" end
+				local ok, pos = pcall(function() return m:GetPivot().Position end)
+				if ok and pos then return pos, "Miku (travelling merchant)" end
+			end
+		end
+		local wanderer = map and map:FindFirstChild("Wanderer")
+		if wanderer and wanderer:IsA("Model") then
+			local root = wanderer:FindFirstChild("HumanoidRootPart")
+			if root then return root.Position, "Wanderer" end
+			local ok, pos = pcall(function() return wanderer:GetPivot().Position end)
+			if ok and pos then return pos, "Wanderer" end
+		end
+		for _, p in ipairs(game.Players:GetPlayers()) do
+			if p ~= plr and (string.lower(p.Name):match("miku") or string.lower(p.DisplayName):match("miku")) then
+				local root = p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+				if root then return root.Position, "player " .. p.Name end
+			end
+		end
+		return nil, nil
+	end
+
+	gbTeleportNPC:CreateButton({
+		Name = "Scan Miku",
+		Callback = function()
 			local pos, who = find_miku()
 			if not pos then
 				mikuLabel:Set("miku: not spawned (try again later)")
-				return
+			else
+				mikuLabel:Set("miku: found -> " .. tostring(who))
 			end
-			local ok = teleport_to(pos)
-			mikuLabel:Set(ok and ("miku: tp -> " .. who) or "miku: tp failed")
-		end)
-	end,
-})
+		end,
+	})
+
+	gbTeleportNPC:CreateButton({
+		Name = "TP to Miku",
+		Callback = function()
+			task.spawn(function()
+				local pos, who = find_miku()
+				if not pos then
+					mikuLabel:Set("miku: not spawned (try again later)")
+					return
+				end
+				mikuLabel:Set("miku: teleporting…")
+				local ok, err = WALK.respawnJump(pos)
+				mikuLabel:Set(ok and ("miku: tp -> " .. who) or ("miku: tp failed (" .. tostring(err or "err") .. ")"))
+			end)
+		end,
+	})
+end
 
 gbAxes:CreateParagraph({
 	Title = "How buying works",
