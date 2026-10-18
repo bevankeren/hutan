@@ -1,24 +1,74 @@
 # Connector untuk HP (Android)
 
-Konektor MCP default-nya menembak `localhost:16384`. Di HP, `localhost` itu HP-nya
-sendiri, bukan PC — jadi konektor versi PC tidak akan pernah nyambung dari Android.
+Cara paling ringkas — **tidak perlu file 64 KB, tidak perlu copy-paste**. Bridge MCP
+sudah menyajikan konektornya sendiri di `/script.luau`, dan konektor itu membaca
+`getgenv().BridgeURL` sebelum jatuh ke default `localhost`.
 
-Versi HP di repo ini sudah diubah supaya menembak **IP LAN PC**:
+Jadi cukup set alamat PC **sebelum** load:
 
+```lua
+getgenv().BridgeURL = "192.168.0.132:16384"
+
+while not getgenv().MCP_Loaded do
+    pcall(function()
+        loadstring(game:HttpGet("http://" .. getgenv().BridgeURL .. "/script.luau"))()
+    end)
+    task.wait(0.15)
+end
 ```
-192.168.0.132:16384
+
+Itu saja. Ganti `192.168.0.132` kalau IP PC berubah.
+
+---
+
+## Kenapa ini lebih baik daripada file statis
+
+| | `/script.luau` | file `connector_phone.luau` |
+|---|---|---|
+| Ukuran yang harus ditempel | ~10 baris | 64 KB |
+| Ikut update bridge | ya, otomatis | tidak, harus replace manual |
+| Ganti IP | edit satu baris | edit satu string di file 64 KB |
+| Butuh akses repo | tidak | ya |
+
+Konektor dari bridge itu **byte-nya beda** dengan file yang ada di disk
+(64764 vs 64768) — artinya bridge menyajikan versi build-nya sendiri, bukan copy
+dari `connector.luau` di folder Downloads. Jadi memakai `/script.luau` selalu dapat
+versi yang paling cocok dengan bridge yang sedang jalan.
+
+---
+
+## Cara kerjanya
+
+Di baris 2980 konektor ada guard:
+
+```lua
+if getgenv().MCP_Loaded == true then
+    return
+end
+
+getgenv().MCP_Loaded = true
+
+local b = getgenv().BridgeURL or getgenv().bridgeurl or ... or "localhost:16384"
+getgenv().BridgeURL = b
+getgenv().bridgeurl = b
 ```
+
+Urutannya penting: `MCP_Loaded` dicek dulu, lalu di-set, lalu `BridgeURL` dibaca.
+Artinya kalau `getgenv().BridgeURL` sudah diisi sebelum load, nilai itu yang dipakai —
+default `localhost` tidak pernah tersentuh.
+
+Loop `while not getgenv().MCP_Loaded` juga berguna: kalau percobaan pertama gagal
+(bridge belum siap, Wi-Fi baru nyambung), dia coba lagi tiap 150 ms sampai berhasil.
 
 ---
 
 ## Syarat
 
-1. HP dan PC di **jaringan Wi-Fi yang sama**.
-2. PC menyala dan MCP bridge jalan (port 16384 listen).
-3. Firewall PC mengizinkan inbound 16384 — sudah ada rule `roblox-mcp bridge 16384`.
-4. IP PC tidak berubah. Kalau router kasih IP baru, konektor harus di-replace lagi.
+1. HP dan PC di **Wi-Fi yang sama**.
+2. MCP bridge jalan di PC, port 16384 listen.
+3. Firewall PC mengizinkan inbound 16384 — rule `roblox-mcp bridge 16384` sudah ada.
 
-Cek IP PC sekarang:
+Cek IP PC:
 
 ```powershell
 Get-NetIPAddress -AddressFamily IPv4 |
@@ -26,74 +76,38 @@ Get-NetIPAddress -AddressFamily IPv4 |
   Select-Object IPAddress, InterfaceAlias
 ```
 
-Kalau IP-nya berubah, edit `connector_phone.luau` dan ganti `192.168.0.132:16384`
-sesuai IP baru.
-
----
-
-## Cara pakai di HP
-
-1. Buka `connector_phone.luau` dari repo, copy **seluruh isinya** (64 KB).
-2. Buka executor di HP (Delta, Codex, Arceus X, Fluxus, atau apa pun yang support
-   `HttpGet` dan `setclipboard`).
-3. Inject ke Roblox, lalu tempel dan jalankan isi file itu.
-
-Kalau executor HP tidak nyaman menempel 64 KB, pakai host yang bisa diakses HP:
-
-```lua
-loadstring(game:HttpGet("http://192.168.0.132:8791/connector_phone.luau"))()
-```
-
-Itu memakai HTTP server lokal yang sudah jalan di port 8791. Pastikan server itu hidup:
-
-```powershell
-cd "C:\Users\bevan\OneDrive\Documents\ChatGPT\foresters"
-python -m http.server 8791 --bind 0.0.0.0
-```
-
-Perhatikan `--bind 0.0.0.0`, bukan `127.0.0.1` — kalau bind ke localhost, HP tidak
-bisa mengaksesnya.
-
 ---
 
 ## Verifikasi
 
-Setelah dijalankan, dari PC cek:
+Dari browser HP, buka:
 
 ```
-list-clients
+http://192.168.0.132:16384/health
 ```
 
-Kalau HP-nya nyambung, akan muncul dua client: satu PC, satu HP. Bedakan dari
-username dan platform:
+Harus muncul `MCP Server Running`. Kalau ini gagal, executor juga akan gagal — betulkan
+jaringan dulu.
 
-```
-<id-pc>     | GaringKriuks @ Foresters ... (desktop)
-<id-hp>     | <nama> @ Foresters ...      (mobile)
-```
-
-Setelah itu setiap tool MCP bisa diarahkan ke HP dengan `set-active-client`, atau
-per-call lewat parameter `clientId`.
+Setelah konek, dari PC jalankan `list-clients`. Akan muncul dua entry; bedakan dari
+platform dan username.
 
 ---
 
-## Kalau gagal nyambung
+## Troubleshooting
 
 | Gejala | Penyebab | Perbaikan |
 |---|---|---|
-| `list-clients` kosong | HP tidak sampai ke bridge | tes buka `http://192.168.0.132:16384/health` dari browser HP — harus muncul `MCP Server Running` |
-| Browser HP timeout | firewall | cek rule `roblox-mcp bridge 16384`, atau matikan firewall sementara untuk tes |
-| Browser HP jalan tapi executor gagal | executor memblokir HTTP non-HTTPS | pakai executor lain, atau tempel file langsung |
-| Dulu nyambung, sekarang tidak | IP PC berubah | cek IP lagi, replace di `connector_phone.luau` |
-| Nyambung lalu putus | Wi-Fi PC sleep / pindah jaringan | set PC agar tidak sleep, pastikan satu SSID |
+| Browser HP timeout | beda Wi-Fi / firewall | pastikan satu SSID, cek rule firewall 16384 |
+| Browser HP OK, executor gagal | executor blokir HTTP non-HTTPS | coba executor lain |
+| Dulu jalan, sekarang tidak | IP PC berubah | cek IP, ganti satu baris `BridgeURL` |
+| Loop tidak pernah selesai | `MCP_Loaded` sudah `true` dari sesi lama | `getgenv().MCP_Loaded = nil` lalu jalankan ulang |
+| Nyambung lalu putus | PC sleep | set PC tidak sleep |
 
----
+Baris terakhir itu penting: kalau konektor pernah jalan lalu mati, `MCP_Loaded` tetap
+`true` dan guard akan langsung `return` tanpa menyambung ulang. Reset dulu:
 
-## Catatan
-
-`connector_pc.luau` tetap memakai `localhost:16384` dan **jangan** dipakai di HP.
-Kalau ketuker, konektor akan mencari bridge di HP sendiri dan tidak ketemu.
-
-File ini dibuat dengan mengganti satu string default di `connector.luau` asli dari
-`C:\Users\bevan\Downloads\roblox-executor-mcp\connector.luau`. Tidak ada logika lain
-yang diubah, jadi perilakunya identik dengan versi PC selain alamat tujuan.
+```lua
+getgenv().MCP_Loaded = nil
+getgenv().MCP_ClientSessionId = nil
+```
