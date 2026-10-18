@@ -1456,7 +1456,17 @@ local function esp_merchants_loop(myToken)
 		local myRoot = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
 		if myRoot then
 			local seen = {}
-			for _, d in ipairs(workspace:GetDescendants()) do
+			-- *scan only the NPC folders, not the whole workspace. A full
+			-- workspace:GetDescendants() walks 19,587 instances and costs 13ms per call
+			-- on this map; on the phone that lands as a visible hitch every second.*
+			local npcRoot = workspace.Map and workspace.Map:FindFirstChild("NPCs")
+			local roots = npcRoot and {npcRoot} or {}
+			if workspace.Map then
+				local wanderer = workspace.Map:FindFirstChild("Wanderer")
+				if wanderer then roots[#roots+1] = wanderer end
+			end
+			for _, root in ipairs(roots) do
+			for _, d in ipairs(root:GetDescendants()) do
 				if d:IsA("Model") and d.Name:lower():match("merchant") and not seen[d] then
 					local ok, pos = pcall(function() return d:GetPivot().Position end)
 					if ok and pos then
@@ -1481,6 +1491,7 @@ local function esp_merchants_loop(myToken)
 						end
 					end
 				end
+			end
 			end
 			for m, tag in pairs(ESP.merchTags) do
 				if not seen[m] then
@@ -2597,7 +2608,20 @@ local function nearest_merchant()
 	local best, bestD = nil, math.huge
 	local root = hrp()
 	if not root then return nil end
-	for _, d in ipairs(workspace:GetDescendants()) do
+	-- *scope the scan to the NPC containers. A full workspace:GetDescendants() walks
+	-- 19,587 instances for 13ms; auto-sell runs this on every pass, which is a visible
+	-- hitch on the phone.*
+	local roots = {}
+	local map = workspace:FindFirstChild("Map")
+	if map then
+		local npcs = map:FindFirstChild("NPCs")
+		if npcs then roots[#roots+1] = npcs end
+		local wanderer = map:FindFirstChild("Wanderer")
+		if wanderer then roots[#roots+1] = wanderer end
+	end
+	if #roots == 0 then roots = {workspace} end
+	for _, container in ipairs(roots) do
+	for _, d in ipairs(container:GetDescendants()) do
 		if d:IsA("Model") and d.Name:lower():match("merchant") then
 			local ok, pos = pcall(function() return d:GetPivot().Position end)
 			if ok and pos then
@@ -2609,6 +2633,7 @@ local function nearest_merchant()
 			local dist = (d.Position - root.Position).Magnitude
 			if dist < bestD then best, bestD = d, dist end
 		end
+	end
 	end
 	return best, bestD
 end
