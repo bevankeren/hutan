@@ -127,6 +127,7 @@ S.minValue = tonumber(S.minValue) or 0
 S.maxRows = tonumber(S.maxRows) or 8
 S.weightValue = type(S.weightValue) == "number" and S.weightValue or 0.6
 S.includeGrowing = S.includeGrowing == true
+S.sameIslandOnly = S.sameIslandOnly ~= false
 do
 	local e = S.esp
 	e.players = e.players or false
@@ -220,6 +221,12 @@ local function teleport_to(pos, offset, finalFacing)
 	local from = root.Position
 	local delta = dest - from
 	local dist = delta.Magnitude
+	-- *cross-island safety ceiling: attempting to walk across the ocean to another
+	-- island triggers the server MovementGuardService to kick/teleport the player.
+	-- Local island travel never exceeds 280 studs.*
+	if dist > 280 then
+		return false, "cross-island distance blocked"
+	end
 	if dist <= SNAP_STEP then
 		root.CFrame = finalFacing or CFrame.new(dest)
 		root.AssemblyLinearVelocity = Vector3.zero
@@ -554,10 +561,43 @@ local function fmt_remaining(sec)
 	return ("%dm%02ds"):format(m, s)
 end
 
+local ISLAND_BOUNDS = {
+	{Folder = "OakIsland", Biome = "StarterForest", X = 84.5, Z = -562.1, HalfW = 292, HalfD = 202},
+	{Folder = "BirchIsland", Biome = "BirchHills", X = 711.9, Z = -569.2, HalfW = 212, HalfD = 321},
+	{Folder = "CrescentIsland", Biome = "PalmCove", X = 104.1, Z = 145.9, HalfW = 290, HalfD = 303},
+	{Folder = "SnowyPines", Biome = "SnowyPines", X = 1361.1, Z = -626.4, HalfW = 278, HalfD = 294},
+	{Folder = "DustyMesa", Biome = "DustyMesa", X = -626.1, Z = 341.1, HalfW = 254, HalfD = 314},
+	{Folder = "RedwoodGrove", Biome = "RedwoodGrove", X = -8.9, Z = -1216.7, HalfW = 226, HalfD = 226},
+}
+
+local function current_island_biome()
+	local root = hrp()
+	if not root then return nil end
+	local pos = root.Position
+	for _, isl in ipairs(ISLAND_BOUNDS) do
+		if pos.X >= (isl.X - isl.HalfW) and pos.X <= (isl.X + isl.HalfW) and pos.Z >= (isl.Z - isl.HalfD) and pos.Z <= (isl.Z + isl.HalfD) then
+			return isl.Biome, isl.Folder
+		end
+	end
+	return nil, nil
+end
+
+local function on_same_island(tree)
+	local myBiome = current_island_biome()
+	if not myBiome then return true end
+	local tBiome = tree:GetAttribute("Biome")
+	return tBiome == myBiome
+end
+
 -- what the table may show: Ready, our own Locked, and Growing when the toggle is on
 local function is_candidate(tree)
-	if is_live(tree) then return true end
-	return S.includeGrowing and is_growing(tree)
+	if not is_live(tree) and not (S.includeGrowing and is_growing(tree)) then
+		return false
+	end
+	if S.sameIslandOnly and not on_same_island(tree) then
+		return false
+	end
+	return true
 end
 
 local function held_axe_id()
@@ -1096,7 +1136,9 @@ local function pick(mode, blocked)
 	local skipped, panicked, filtered = 0, 0, 0
 	for _, t in ipairs(folder:GetChildren()) do
 		if is_live(t) and not (blocked[t] and blocked[t] > now) then
-			if not passes_rarity(t) then
+			if S.sameIslandOnly and not on_same_island(t) then
+				filtered += 1
+			elseif not passes_rarity(t) then
 				-- *this is the bug the Captain saw: an Uncommon outranking a Mythic.
 				-- the floor drops it out of the pool entirely before any sorting.*
 				filtered += 1
@@ -1449,7 +1491,10 @@ local okTop, errTop = pcall(function()
 					safe_set(topLabel, ("camping %s — %s"):format(woodName, fmt_remaining(grow_remaining(t))))
 					task.spawn(function()
 						local okP, result = pcall(function()
-							teleport_to(t:GetPivot().Position, Vector3.new(0, 1, 5))
+							local okTp, errTp = teleport_to(t:GetPivot().Position, Vector3.new(0, 1, 5))
+							if not okTp then
+								return false, errTp or "teleport blocked"
+							end
 							task.wait(0.4)
 							local deadline = os.clock() + math.max(grow_remaining(t) or 0, 0) + 30
 							while t.Parent and os.clock() < deadline do
@@ -1485,9 +1530,12 @@ local okTop, errTop = pcall(function()
 					local okP = pcall(function()
 						-- *pivot, not Trunk.Position: the trunk can sit high on a tall model,
 						-- which put us 15.4 studs out and past the 14-stud ReachStuds*
-						teleport_to(t:GetPivot().Position, Vector3.new(0, 1, 5))
+						local okTp, errTp = teleport_to(t:GetPivot().Position, Vector3.new(0, 1, 5))
+						if not okTp then
+							return false, errTp or "teleport blocked"
+						end
 						task.wait(0.4)
-						good, result = chop_tree(t)
+						return chop_tree(t)
 					end)
 					if okP and good then
 						safe_set(topLabel, ("sniped %s"):format(woodName))
@@ -1951,6 +1999,21 @@ gbFarm:CreateToggle({
 		S.includeGrowing = on
 		if topLabel then
 			safe_set(topLabel, on and "growing trees included" or "growing trees hidden")
+		end
+	end,
+})
+
+-- *same island lock: stops the table and autofarm from targeting trees 800+ studs
+-- away across the ocean on other islands, which triggers the server MovementGuardService
+-- to kick or reconnect the player to another server*
+gbFarm:CreateToggle({
+	Name = "Same island only",
+	Flag = "SameIslandOnly",
+	CurrentValue = S.sameIslandOnly ~= false,
+	Callback = function(on)
+		S.sameIslandOnly = on
+		if topLabel then
+			safe_set(topLabel, on and "locked to current island" or "all islands shown")
 		end
 	end,
 })
@@ -2590,6 +2653,8 @@ local function sync_state_from_flags()
 	if tonumber(v) then S.refreshRate = tonumber(v) end
 	v = val("IncludeGrowing")
 	if type(v) == "boolean" then S.includeGrowing = v end
+	v = val("SameIslandOnly")
+	if type(v) == "boolean" then S.sameIslandOnly = v end
 	v = val("PanicMode")
 	if type(v) == "boolean" then S.panicOn = v end
 	v = val("PanicRadius")
