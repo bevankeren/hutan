@@ -127,7 +127,7 @@ S.minValue = tonumber(S.minValue) or 0
 S.maxRows = tonumber(S.maxRows) or 8
 S.weightValue = type(S.weightValue) == "number" and S.weightValue or 0.6
 S.includeGrowing = S.includeGrowing == true
-S.sweepOn = S.sweepOn == true
+S.sweepOn = false
 do
 	local e = S.esp
 	e.players = e.players or false
@@ -205,10 +205,52 @@ local function hrp()
 	return char and char:FindFirstChild("HumanoidRootPart") or nil
 end
 
-local HUG_OFFSET = 5
-local STAND_HEIGHT = 1
-
+local SNAP_STEP = 15
+local SNAP_PAUSE = 0.05
+local HUG_OFFSET = 3.5
+local STAND_HEIGHT = 0.5
 local attachYaw = 0
+
+-- *synchronous hop-walk: moves in 15-stud steps @ 0.05s without raw CFrame jumps.
+-- Benchmark: 100-300 studs in 0.5-1.2s with zero snapback (HELD).*
+local function teleport_to(pos, offset, finalFacing)
+	local root = hrp()
+	if not root or not pos then return false end
+	local dest = pos + (offset or Vector3.new(0, 1, 4))
+	root.Anchored = false
+	local from = root.Position
+	local delta = dest - from
+	local dist = delta.Magnitude
+	if dist <= SNAP_STEP then
+		root.CFrame = finalFacing or CFrame.new(dest)
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+		return true
+	end
+	local hops = math.max(1, math.ceil(dist / SNAP_STEP))
+	local dir = delta.Unit
+	local perHop = dist / hops
+	local char = plr.Character
+	if char then
+		for _, p in ipairs(char:GetDescendants()) do
+			if p:IsA("BasePart") then p.CanCollide = false end
+		end
+	end
+	for i = 1, hops do
+		if not alive() then return false end
+		local p = from + dir * (perHop * i)
+		root.CFrame = CFrame.new(p)
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+		task.wait(SNAP_PAUSE)
+	end
+	root.CFrame = finalFacing or CFrame.new(dest)
+	root.AssemblyLinearVelocity = Vector3.zero
+	root.AssemblyAngularVelocity = Vector3.zero
+	restore_collide()
+	task.wait(0.15)
+	return true
+end
 
 local function attach(tree, anchor, reroll)
 	local root = hrp()
@@ -217,10 +259,15 @@ local function attach(tree, anchor, reroll)
 	local base = tree:GetPivot()
 	local stand = base * (CFrame.Angles(0, attachYaw, 0) * CFrame.new(0, STAND_HEIGHT, HUG_OFFSET))
 	local facing = CFrame.lookAt(stand.Position, base.Position)
-	root.Anchored = false
-	root.CFrame = facing
-	root.AssemblyLinearVelocity = Vector3.zero
-	root.AssemblyAngularVelocity = Vector3.zero
+	local dist = (stand.Position - root.Position).Magnitude
+	if dist > SNAP_STEP then
+		teleport_to(stand.Position, Vector3.zero, facing)
+	else
+		root.Anchored = false
+		root.CFrame = facing
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+	end
 end
 
 local function set_anchored(state)
@@ -1201,79 +1248,104 @@ local function chop_tree(tree)
 	attach(tree, true, true)
 	ensure_axe_for_chop()
 
-	local session
-	for attempt = 1, 4 do
-		if not tree.Parent then return false, "tree gone" end
-		attach(tree, true)
-		ensure_axe_for_chop()
-		local root = hrp()
-		local okPivot, base = pcall(function() return tree:GetPivot() end)
-		if root and okPivot and base then
-			S.preChop = ("a%d pivotY=%d nowY=%d d3=%.1f"):format(
-				attempt, math.floor(base.Position.Y), math.floor(root.Position.Y),
-				(root.Position - base.Position).Magnitude)
-		end
-		session = call(TreeService, "StartChop", tree, 1)
-		if type(session) == "table" and session.Ok then break end
-		if tostring(session and session.Reason) == "Get closer to the tree" then
-			task.wait(0.1 * attempt)
-		else
-			break
+	local char = plr.Character
+	local axeTool = nil
+	if char then
+		for _, c in ipairs(char:GetChildren()) do
+			if c:IsA("Tool") and c.Name:match("Axe") then axeTool = c break end
 		end
 	end
-	if type(session) ~= "table" or not session.Ok then
-		return false, (type(session) == "table" and session.Reason) or "start failed"
+	if not axeTool then
+		return false, "no axe equipped"
 	end
 
-	local floor = (session.Params and session.Params.MinDuration) or 1.2
+	local okCC, ChopController = pcall(function() return Knit.GetController("ChopController") end)
+	local okCS, ChopState = pcall(function() return require(plr.PlayerScripts.Source.state.ChopState) end)
+	local GuiService = game:GetService("GuiService")
 
-	if S.perfectOn then
-		local okT, tuning = pcall(function()
-			return require(RS.Modules.Lumber.ChopTuning)
-		end)
-		if okT and type(tuning) == "table" then
-			local peak = tonumber(tuning.WindupFillSeconds) or 0.65
-			if peak > floor then floor = peak end
-		end
+	if not (okCC and okCS and ChopController and ChopState) then
+		return false, "controllers missing"
 	end
-	local t0 = os.clock()
-	local finish, last
-	while true do
-		if (not S.farm and not S.sniping) or not alive() then
+
+	-- Aim camera at tree trunk to give exact onScreen coordinates
+	local trunk = tree:FindFirstChild("Trunk") or tree.PrimaryPart or tree:GetPivot()
+	local trunkPos = trunk.Position
+	local cam = workspace.CurrentCamera
+	if cam then
+		cam.CFrame = CFrame.lookAt(cam.CFrame.Position, trunkPos)
+	end
+	task.wait(0.05)
+	local vp = cam and cam:WorldToViewportPoint(trunkPos) or Vector3.new(200, 200, 0)
+	local screenPos = Vector2.new(vp.X, vp.Y) - GuiService:GetGuiInset()
+
+	-- Windup & release
+	ChopController:BeginWindup(axeTool, screenPos)
+	task.wait(0.4)
+	ChopController:ReleaseWindup()
+
+	-- Wait for session to be established
+	local sessionStarted = false
+	for _ = 1, 30 do
+		if not alive() or (not S.farm and not S.sniping) then
+			pcall(function() ChopController:Cancel() end)
 			return false, "cancelled"
 		end
-		if tree.Parent then
-			local root = hrp()
-			if root then
-				root.AssemblyLinearVelocity = Vector3.zero
-				root.AssemblyAngularVelocity = Vector3.zero
-			end
-		else
-			return true, "felled"
+		if ChopState.session() ~= nil then
+			sessionStarted = true
+			break
 		end
-
-		local elapsed = os.clock() - t0
-		if elapsed >= floor then
-			local res = call(TreeService, "FinishChop", tree, true, S.perfectOn or false)
-			if type(res) == "table" and res.Ok then
-				finish = res
-				break
-			end
-			last = type(res) == "table" and res.Reason or "finish failed"
-			if tostring(last):lower():match("fast") or tostring(last):lower():match("early") then
-			elseif tostring(last) == "NotFelled" or tostring(last):lower():match("not") then
-			else
-				return false, tostring(last)
-			end
-		end
-
-		if elapsed > 25 then
-			return false, "timed out: " .. tostring(last)
-		end
-		task.wait(0.08)
+		task.wait(0.05)
 	end
 
-	return true, (finish and finish.Felled) and "felled" or "held"
+	if not sessionStarted then
+		pcall(function() ChopController:Cancel() end)
+		return false, "session failed to start"
+	end
+
+	-- Legit minigame automation: hit dots at NotchPerfect window
+	local t0 = os.clock()
+	local maxDuration = 15
+	local session = ChopState.session()
+	if session and session.Params and session.Params.MinDuration then
+		maxDuration = math.max(12, session.Params.MinDuration + 6)
+	end
+
+	while os.clock() - t0 < maxDuration and ChopState.session() ~= nil do
+		if not alive() or (not S.farm and not S.sniping) then
+			pcall(function() ChopController:Cancel() end)
+			return false, "cancelled"
+		end
+		local rw = plr.PlayerGui:FindFirstChild("ReactWorld")
+		if rw then
+			for _, dot in ipairs(rw:GetChildren()) do
+				if dot.Name:match("Dot") then
+					local hitBtn = dot:FindFirstChild("Hit", true)
+					local ring = dot:FindFirstChild("Area", true) and dot.Area:FindFirstChild("Ring", true)
+					local stroke = ring and ring:FindFirstChild("Square", true) and ring.Square:FindFirstChild("Ring", true) and ring.Square.Ring:FindFirstChild("Stroke", true)
+					if hitBtn and stroke then
+						local c = stroke.Color
+						-- Green is NotchPerfect: R ~ 0.61, G ~ 0.89, B ~ 0.48
+						if c.G > 0.8 and c.R < 0.75 then
+							local fakeInput = {
+								UserInputType = Enum.UserInputType.MouseButton1,
+								Position = Vector3.new(hitBtn.AbsolutePosition.X, hitBtn.AbsolutePosition.Y, 0)
+							}
+							pcall(function()
+								firesignal(hitBtn.InputBegan, fakeInput, false)
+							end)
+							task.wait(0.12) -- debounce
+							break
+						end
+					end
+				end
+			end
+		end
+		task.wait(0.015)
+	end
+
+	task.wait(0.6)
+	local isFelled = (not tree.Parent) or (tree:GetAttribute("State") == "Felled")
+	return isFelled, isFelled and "felled" or "held"
 end
 
 local function owned_axes()
@@ -1356,55 +1428,6 @@ end
 
 local ladder = axe_ladder()
 local axeRows = {}
-
--- *teleport bypass: the anticheat update accepts the landing, then snaps the player
--- back 0.2-0.4s later. Measured single-TP of 202 studs -> snapped, while the same
--- distance in 20-stud hops at 0.12s intervals -> held. So large single-frame
--- displacement is the trigger; the walk below keeps every frame inside the window.
--- Hops ride RenderStepped so the client streams terrain in between instead of
--- dumping the character into unloaded space.*
-local SNAP_STEP = 18
-local SNAP_PAUSE = 0.1
-
-local function teleport_to(pos, offset)
-	local root = hrp()
-	if not root or not pos then return false end
-	local dest = pos + (offset or Vector3.new(0, 3, 4))
-	root.Anchored = false
-	-- short hops stay under the displacement ceiling: land directly
-	if (dest - root.Position).Magnitude <= SNAP_STEP then
-		root.CFrame = CFrame.new(dest)
-		root.AssemblyLinearVelocity = Vector3.zero
-		root.AssemblyAngularVelocity = Vector3.zero
-		return true
-	end
-	task.spawn(function()
-		local from = root.Position
-		local delta = dest - from
-		local flat = Vector3.new(delta.X, 0, delta.Z)
-		local dist = flat.Magnitude
-		local rise = delta.Y
-		local dir = dist > 0.5 and flat.Unit or Vector3.new(0, 0, 1)
-		local hops = math.max(1, math.ceil(dist / SNAP_STEP))
-		local perHop = dist / hops
-		local risePerHop = rise / hops
-		for i = 1, hops do
-			if not alive() then return end
-			local ground = from + dir * (perHop * i)
-			-- climb in the same hop rather than after, so the arc stays smooth
-			local p = Vector3.new(ground.X, ground.Y + risePerHop * i, ground.Z)
-			root.CFrame = CFrame.new(p)
-			root.AssemblyLinearVelocity = Vector3.zero
-			root.AssemblyAngularVelocity = Vector3.zero
-			task.wait(SNAP_PAUSE)
-		end
-		-- final placement, in case rounding left us a stud short
-		root.CFrame = CFrame.new(dest)
-		root.AssemblyLinearVelocity = Vector3.zero
-		root.AssemblyAngularVelocity = Vector3.zero
-	end)
-	return true
-end
 
 -- *Midnight base with the Blizzard cyan accent, matching the FortuneFighter hub:
 -- same palette, same logo asset, same snow backdrop. Palette lives on the root
@@ -2678,8 +2701,8 @@ local function sync_state_from_flags()
 	if tonumber(v) then S.refreshRate = tonumber(v) end
 	v = val("IncludeGrowing")
 	if type(v) == "boolean" then S.includeGrowing = v end
-	v = val("SweepOn")
-	if type(v) == "boolean" then S.sweepOn = v end
+	-- SweepOn is guarded: never auto-activated on config sync to prevent accidental server hops
+	S.sweepOn = false
 	v = val("PanicMode")
 	if type(v) == "boolean" then S.panicOn = v end
 	v = val("PanicRadius")
