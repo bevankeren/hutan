@@ -838,8 +838,6 @@ Job   : 14baa559-5036-4063-8087-ea3fdd422ae2
 - Perubahan diimplementasikan pada source code [farm_hub_src.lua](file:///c:/Users/bevan/OneDrive/Documents/ChatGPT/foresters/farm_hub_src.lua).
 - Siap untuk diobfuskasi ulang atau di-deploy.
 
----
-
 ## 2026-10-18 19:58:00 +07:00 — rilis build terobfuskasi terbaru (Centurion v6.2) ke GitHub
 
 Game  : Foresters 🌳 [RELEASE]
@@ -857,6 +855,41 @@ Job   : 14baa559-5036-4063-8087-ea3fdd422ae2
 ### Bukti
 - File `farm_hub.lua` terupdate ke 597.465 bytes.
 - Commit dan push ke `origin/main` sukses.
+
+---
+
+## 2026-10-18 20:44:00 +07:00 — fix 3-detik freeze & fix autofarm jatuh ke void / nembus air
+
+Game  : Foresters 🌳 [RELEASE]
+Place : 117020342702668
+Client: 0.743.0.7431134
+Job   : c798c76f-88a7-4200-97ce-f2df779f7505
+
+### Perubahan
+1. Memasang Roact CrashGuard Metamethod Hook di awal file `farm_hub_src.lua`:
+   - Meng-intercept pemanggilan `__index` pada objek `Model` untuk part standar (`Head`, `HumanoidRootPart`, `Torso`, `UpperTorso`, `Humanoid`).
+   - Jika part tersebut belum ter-stream in oleh game engine, fungsi resolver mengembalikan `PrimaryPart`, `FindFirstChildWhichIsA("BasePart")`, atau `nil` alih-alih melempar exception fatal (`Head is not a valid member of Model "..."`).
+   - Mencegah `CrashGuard` pada Roact UI game Foresters me-reset dan menggambar ulang seluruh hierarki UI pohon (eliminasi freeze 2-3 detik).
+2. Memperbaiki Bug Noclip & Jatuh ke Void pada `farm_hub_src.lua`:
+   - Menghapus baris `noclipOn = true` pada koneksi `plr.CharacterAdded`. Memastikan `noclipOn = false` dan memanggil `restore_collide()` setiap respawn agar bagian tubuh karakter tetap padat (`CanCollide = true`).
+   - Mengaktifkan `rp.IgnoreWater = true` pada `RaycastParams` di `WALK.respawnJump`, `WALK.bikeJump`, dan `settle_on_ground()` sehingga deteksi permukaan tanah tidak menabrak air laut (air di Roblox tidak memiliki kolisi fisik dan menyebabkan karakter tembus ke dasar laut).
+   - Memperbaiki `settle_on_ground()` agar menempelkan posisi ketinggian karakter (`Y`) secara dua arah ke `ray.Position.Y + 3.0` dan memulihkan state `Landed` serta `FallingDown` humanoid.
+   - Mengubah recovery jatuh dari `Y < -100` (yang sebelumnya melempar ke Y=60 di udara lepas) menjadi clean respawn pada `Y < -20` sehingga karakter ter-spawn ulang di pulau aman.
+3. Debounce & Cache Animasi Nama:
+   - Menambahkan pengecekan `if lbl:FindFirstChild("BlizzardGlimmer") then return end` di `apply_glimmer` agar tidak menghapus dan membuat ulang instance tween/gradient secara terus-menerus.
+   - Menambahkan guard flag `inChange` pada `nameLabel:GetPropertyChangedSignal("Text")` untuk mencegah sinyal rekursif.
+
+### Alasan
+- Laporan Captain: "stutter ngelagnya makin berasa, autofarm gw sering jatuh ke void kayak nembusgitu, etnah gara gara air atau apa, tp yg paling berasa sih stutternya , udah gitu sekali stutter bs freeze 3 detik, padahal gwdh set 20 detik skali refreshnya".
+- Investigasi log membuktikan:
+  1. Freeze 3 detik bukan dari timer refresh pohon, melainkan crash fatal UI bawaan game: `[UIController] The UI crashed and will be drawn again: Error: Head is not a valid member of Model "Prospector Dale" in QuestMark in Frame in App in CrashGuard`. Akibat StreamingEnabled, model NPC yang berada jauh belum memiliki `Head` saat diakses oleh skrip UI game, memicu CrashGuard merestart seluruh UI tree Roblox.
+  2. Jatuh ke void terjadi karena `CharacterAdded` mengaktifkan `noclipOn = true` (mematikan kolisi seluruh tubuh karakter setiap frame via `RenderStepped`) dan raycast mendarat di permukaan air (`RaycastParams.IgnoreWater = false`).
+
+### Bukti
+- Metamethod hook teruji langsung pada live client: pengujian `m.Head` pada model tanpa Head mengembalikan fallback part/nil secara instan tanpa melempar runtime exception.
+- Nilai `rp.IgnoreWater = true` mencegah titik pendaratan tersangkut di atas permukaan air tanpa kolisi.
+- Kolisi karakter pulih 100% setelah teleport dan respawn jump.
+
 
 
 
