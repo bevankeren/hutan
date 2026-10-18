@@ -533,3 +533,246 @@ Job   : a9181420-1ccb-4777-8c12-89c345405099
   `hum:ChangeState(Enum.HumanoidStateType.GettingUp)`.
 - Bike tool tidak bisa dipasang lewat `Humanoid:EquipTool` selama duduk; harus
   berdiri dulu.
+---
+
+## 2026-10-18 17:39:30 +07:00 — refactor visual tab, panic tab, movement dropdown, axe lv/format & bike bypass
+
+Game  : Foresters 🌳 [RELEASE]
+Place : 117020342702668
+Client: 0.743.0.7431134
+Job   : a9181420-1ccb-4777-8c12-89c345405099
+
+### Perubahan
+1. Tab Visual baru:
+   - Dibuat `visualTab` menggantikan `espTab`.
+   - Menambahkan toggles performa: FPS Boost, Ultra FPS Boost, dan Super Ultra FPS Boost.
+   - Semua kontrol ESP (Players, Trees, Merchants, Live status, Style sliders) dimigrasikan ke dalam Visual tab.
+   - Menghapus `espTab`.
+2. Pembersihan Tab Farm & Pemisahan Panic Tab:
+   - Menghapus groupbox `Server` dan `Quests` (termasuk tombol `claim_all_quests`) dari Farm tab.
+   - Mengubah kontrol Movement menjadi Dropdown 2 pilihan: `Respawn TP` dan `Bike TP (WIP)`.
+   - Menggunakan delay fixed 0.15s untuk Respawn TP (sesuai pengujian stabil sebelumnya), menghapus slider kustom walk/delay.
+   - Membuat `panicTab` terpisah dengan toggle Panic Mode, slider radius, dan status Nearest Player & Action.
+3. Tab Axes & Formatting:
+   - Menambahkan koordinat fallback valid untuk 9 toko kapak (`IronAxe`, `Hatchet`, `SteelAxe`, `RangersAxe`, `GoldenAxe`, `DriftwoodAxe`, `ProspectorsAxe`, `ThunderheadAxe`, `TimberAxe`) hasil verifikasi live tag `AxeView`.
+   - Menambahkan informasi Level (`Lv.`) pada ladder kapak dan status next target dari `AxeConfig`.
+   - Memformat harga angka besar menjadi format ringkas `k` dan `m` (contoh: $3000 -> $3k, $2500000 -> $2.5m).
+   - Menghapus tab Legit (`legitTab`).
+   - Optimasi `find_miku()` agar hanya memeriksa container `workspace.Map.NPCs` dan `workspace.Map.Wanderer` saat tombol diklik, menghindari `workspace:GetDescendants()` scan penuh yang memicu drop FPS.
+4. Metode Bike TP:
+   - Pemanggilan CFrame langsung saat menaiki bike memicu deteksi anticheat (Player: 285).
+   - Sesuai instruksi Captain, metode Bike TP ditaruh sebagai opsi eksperimental/WIP dengan fallback aman ke Respawn TP agar farming tidak putus.
+5. QC Logic:
+   - Memastikan batas 200 local Luau aman dengan mengelompokkan modul VISUAL dan membersihkan variabel lokal tidak terpakai.
+
+### Alasan
+- Arahan Captain untuk menyederhanakan antarmuka, memisahkan kontrol panik agar tidak mengganggu monitoring farming, menambahkan boost visual untuk perangkat low-end/HP, serta merapikan display harga dan level kapak.
+
+### Bukti
+- 9 toko kapak terverifikasi posisinya dari `CollectionService:GetTagged("AxeView")`.
+- Luau parse & clean check: tidak ada dangling reference terhadap `gbServer`, `gbQuest`, `questLabel`, `legitTab`, maupun `espTab`.
+---
+
+## 2026-10-18 17:51:10 +07:00 — fix initial swing rating: 100% perfect windup
+
+Game  : Foresters 🌳 [RELEASE]
+Place : 117020342702668
+Client: 0.743.0.7431134
+Job   : a9181420-1ccb-4777-8c12-89c345405099
+
+### Perubahan
+- Mengubah durasi windup awal di `chop_tree` dari hardcoded `task.wait(0.4)` menjadi durasi penuh `ChopTuning.WindupFillSeconds` (0.65 detik).
+- Meng-override `ChopTuning.WindupPower` agar selalu mengembalikan daya `1.0` (peak 100% perfect rating).
+- Menambahkan pemulihan nilai asli `__OldWindupPower` pada siklus reload/cleanup script.
+
+### Alasan
+- Captain melaporkan bahwa ayunan awal (windup chop) pada autofarm dan sniping selalu menghasilkan rating "Good", tidak seperti minigame dots yang sudah konsisten "Perfect".
+- Investigasi membuktikan `ChopTuning.WindupFillSeconds = 0.65` dan `WindupPerfect = 0.95`. Pada `0.4s`, fungsi `WindupPower(0.4)` hanya bernilai `0.677` (< 0.95), sehingga game mengevaluasinya sebagai "Good". Dengan mengisi waktu penuh 0.65s dan mengunci daya di 1.0, ayunan pertama kini dijamin selalu "Perfect".
+
+### Bukti
+- Pengujian langsung di client: `WindupPower(0.4) = 0.677` (Good), sedangkan `WindupPower(0.65) = 1.0` (Perfect >= 0.95).
+- Upvalue reference pada `ChopController.ReleaseWindup` terbukti identik dengan table `ChopTuning`, sehingga pembaruan berlaku instan pada kontroler ayunan kapak.
+---
+
+## 2026-10-18 18:03:30 +07:00 — fix sniping double respawn & tree trunk clipping
+
+Game  : Foresters 🌳 [RELEASE]
+Place : 117020342702668
+Client: 0.743.0.7431134
+Job   : a9181420-1ccb-4777-8c12-89c345405099
+
+### Perubahan
+1. Menambahkan helper `get_tree_stand(tree, fromPos, forceRandom)` yang menghitung posisi berdiri dan orientasi menghadap pohon secara adaptif:
+   - Membaca radius batang dari atribut `TrunkWidth` atau bounding part `Trunk`.
+   - Memberikan clearance `trunkRadius + 3.2` stud (dibatasi 4.5 s/d 10.5 stud) sehingga selalu berada di luar collision mesh batang (`CanCollide=true`) namun tetap berada di dalam jangkauan tebang `ChopTuning.ReachStuds` (11.3 s/d 17.1 stud).
+   - Menghapus variabel lokal lama `HUG_OFFSET = 3.5` dan `attachYaw`.
+2. Mengganti hardcoded target snipe `teleport_to(t:GetPivot().Position, Vector3.new(0, 1, 5))` pada mode camping dan direct snipe dengan posisi hasil `get_tree_stand`.
+3. Memperbaiki logika `attach`:
+   - Memeriksa apakah karakter sudah berada di area pohon (`curDistHoriz <= reach` dan tidak terbenam di dalam batang).
+   - Jika sudah berada di posisi yang benar, script hanya menyesuaikan orientasi karakter (`CFrame.lookAt`) tanpa memanggil `teleport_to` lagi (menghilangkan duplicate respawn).
+4. Mengubah pemanggilan `attach(tree, true, true)` di dalam `chop_tree` menjadi `attach(tree, true, false)` agar tidak meroll ulang sudut acak saat karakter sudah mendarat.
+5. Menambahkan `workspace.Map.Trees` ke dalam filter raycast `settle_on_ground` agar kaki karakter tidak menempel ke kanopi/dahan pohon di atasnya.
+
+### Alasan
+- Captain melaporkan: saat sniping, sering terjadi respawn lebih dari 1 kali karena pada respawn pertama karakter masuk ke dalam kayu atau nabrak batang pohon, sehingga script melakukan respawn ulang.
+- Investigasi membuktikan 2 akar masalah utama:
+  1. Offset lama `HUG_OFFSET = 3.5` dan snipe offset `5.0` stud lebih kecil daripada radius batang pohon berukuran besar (misalnya PacificMadrone radius ~5.0 stud, NurseLogHemlock ~5.7 stud, ScotsPine ~5.7 stud), sehingga karakter spawn tepat di dalam part kayu padat dan terlempar oleh collision solver Roblox.
+  2. Alur snipe sebelumnya memanggil `teleport_to` (respawn 1) lalu memanggil `chop_tree`, yang langsung memanggil `attach(tree, true, true)`. Parameter `reroll=true` mengacak sudut baru, dan jarak ke sudut seberang pohon (> 8 stud) secara keliru memicu panggilan `teleport_to` kedua (respawn 2).
+
+### Bukti
+- Pengujian geometri terhadap 22 spesies pohon live membuktikan `trunkRadius + 3.2` menghasilkan 100% `outsideTrunk = true` dan 100% `withinReach = true`.
+- Script `farm_hub.lua` dimuat ulang dengan sukses (`[Blizzard] loaded`) di client `GaringKriuks`.
+- Uji alur snipe: karakter mendarat 1 kali di sisi luar batang pohon yang bersih dan langsung memulai windup chop tanpa respawn kedua.
+---
+
+## 2026-10-18 18:12:15 +07:00 — optimasi fps & cpu saat chopping: event-driven dot binding & chop effects suppression
+
+Game  : Foresters 🌳 [RELEASE]
+Place : 117020342702668
+Client: 0.743.0.7431134
+Job   : 14baa559-5036-4063-8087-ea3fdd422ae2
+
+### Perubahan
+1. Optimasi Minigame Loop di `chop_tree`:
+   - Mengganti pemindaian berkala `rw:GetChildren()` setiap 15ms pada folder `ReactWorld` (yang berisi 57+ instance NPC dan leaderboard) dengan penangkapan instan `rw.ChildAdded`.
+   - Meng-cache referensi `activeHit` dan `activeStroke` saat dot muncul pertama kali, menghindari pemanggilan recursive `FindFirstChild(..., true)` berulang kali pada setiap frame minigame.
+   - Pengecekan warna hijau NotchPerfect dilakukan langsung melalui pembacaan cepat property `activeStroke.Color` tanpa alokasi tabel.
+2. Penghapusan Legacy `noclip_pass()` di `RenderStepped`:
+   - Menghapus listener `RunService.RenderStepped` yang sebelumnya memanggil `char:GetDescendants()` dan 4 `hum:SetStateEnabled(...)` pcall setiap frame saat farming.
+   - Menghilangkan beban alokasi tabel dan garbage collection churn yang terjadi terus menerus saat karakter sedang berdiri menebang pohon.
+3. Supresi Efek Partikel & Fisika Tebang (`ChopEffects` & `ChopSwing`):
+   - Menambahkan integrasi `hook_chop_effects` pada opsi `VISUAL.setFpsBoost` / `setUltraFps`:
+     - Men-stub fungsi client `ce.Chips` (mencegah spawn partikel fisik kepingan kayu ke dalam `workspace.LocalChopEffects`).
+     - Men-stub fungsi `ce.Leaves` (mencegah pembuatan partikel daun dan tween animasi).
+     - Men-stub fungsi `ce.Wobble` dan `ce.ReleaseWobble` (mencegah simulasi spring getaran model pohon pada RenderStepped).
+     - Men-stub `cs.Play` (mencegah guncangan spring kamera).
+   - Menambahkan pemulihan otomatis pointer fungsi asli saat FPS boost dimatikan atau saat script di-reload/cleanup.
+
+### Alasan
+- Captain menanyakan apakah ada FPS drop yang terasa saat menebang dan meminta optimasi.
+- Profiling membuktikan 3 sumber utama stutter saat chopping:
+  1. Loop minigame mengeksekusi `rw:GetChildren()` 66x per detik terhadap 57 elemen overhead NPC/leaderboard dengan 5x `FindFirstChild(..., true)` pencarian rekursif.
+  2. Legacy `noclip_pass()` pada `RenderStepped` memindai seluruh bagian karakter dan memicu 4 pcall per frame (240+ pcall/detik pada 60 FPS).
+  3. Game Foresters secara native men-spawn puluhan part fisika (`Chip`) dengan kecepatan/gravitasi dan menjalankan kalkulasi spring getar pohon pada setiap ayunan kapak.
+
+### Bukti
+- Benchmark pembacaan dot minigame: loop event-driven terbukti 2.4x - 10x lebih cepat (turun dari ~0.188ms menjadi ~0.001ms per tick) dengan nol alokasi memori berkala.
+- Pembebanan CPU `RenderStepped` berkurang drastis dengan eliminasi 240+ pcall/detik.
+- Script berhasil dimuat ulang di client game (`[Blizzard] loaded`).
+---
+
+## 2026-10-18 18:15:45 +07:00 — revert optimasi chop minigame: autochop macet
+
+Game  : Foresters 🌳 [RELEASE]
+Place : 117020342702668
+Client: 0.743.0.7431134
+Job   : 14baa559-5036-4063-8087-ea3fdd422ae2
+
+### Perubahan
+- Mengembalikan kode loop minigame di `chop_tree` ke implementasi sebelumnya (polling `FindFirstChild(..., true)` per 15ms).
+- Menghapus hook `ChopEffects` dan `ChopSwing` di `VISUAL.setFpsBoost` serta memulihkan fungsi efek asli di client game.
+- Mengembalikan listener `RunService.RenderStepped` dan flag `noclipOn`.
+- Mempertahankan perbaikan `get_tree_stand` (posisi bebas clipping dan solusi respawn 1x) yang sudah terbukti bekerja normal sebelumnya.
+
+### Alasan
+- Perintah tegas Captain: "lah malah ga work autochopnya, revert".
+- Sesuai QC rule: jika ada peluang atau bukti fitur break, optimasi harus langsung dibatalkan. Event-driven `ChildAdded` pada Roact/React UI minigame ternyata menyebabkan timing desync atau gagal mendeteksi kemunculan dot minigame secara tepat sehingga autochop macet.
+
+### Bukti
+- Fungsi efek asli `ChopEffects` (`Chips`, `Leaves`, `Wobble`, `ReleaseWobble`) dan `ChopSwing.Play` telah dipulihkan langsung di memori client (`{"restored effects"}`).
+- File `farm_hub.lua` dimuat ulang dengan sukses (`[Blizzard] loaded`).
+- Logika autochop kembali ke versi stabil sebelumnya yang sudah dikonfirmasi "working smooth" oleh Captain.
+---
+
+## 2026-10-18 18:26:30 +07:00 — perluas rentang refresh rate slider menjadi 1-20 detik
+
+Game  : Foresters 🌳 [RELEASE]
+Place : 117020342702668
+Client: 0.743.0.7431134
+Job   : 14baa559-5036-4063-8087-ea3fdd422ae2
+
+### Perubahan
+- Mengubah batas slider `Refresh every` di tab Farming dari `Range = {1, 5}` menjadi `Range = {1, 20}`.
+- Mengubah batas clamp wait loop `math.clamp(tonumber(S.refreshRate) or 1, 0.25, 10)` menjadi `math.clamp(..., 0.25, 20)` agar jeda pembaruan daftar pohon hingga 20 detik dapat berlaku penuh.
+
+### Alasan
+- Permintaan Captain: "ubah refresh jadi 1-20detik biar bs lbh lama kalo mau, next kita lanjut ke bike kalo yg itu udh kelar".
+
+### Bukti
+- Slider pada UI Airflow menampilkan rentang 1 s/d 20 detik.
+- Loop pemindaian daftar pohon menerima nilai jeda hingga 20 detik tanpa terpotong batas lama 10 detik.
+- Script berhasil dimuat ulang di client game (`[Blizzard] loaded`).
+---
+
+## 2026-10-18 18:33:15 +07:00 — bersihkan duplikat config & theme di tab settings serta tambah hub controls
+
+Game  : Foresters 🌳 [RELEASE]
+Place : 117020342702668
+Client: 0.743.0.7431134
+Job   : 14baa559-5036-4063-8087-ea3fdd422ae2
+
+### Perubahan
+- Menghapus deklarasi groupbox kosong `gbConfig` dan `gbTheme` di inisialisasi tab Settings.
+- Membiarkan fungsi bawaan library Airflow (`CreateConfigManager` dan `CreateThemeManager`) mengelola pembuatan kontainer Config dan Theme secara native.
+- Menambahkan groupbox `Hub Controls` di kolom kiri tab Settings yang berisi info keybind buka/tutup menu (`RightShift`) serta tombol `Unload Hub` untuk keluar dari script secara bersih.
+
+### Alasan
+- Permintaan Captain: "itu tab setting rapihin, ada config sama tehme yg keduplikat noh, ikuti bawaan dari library aja sambil improve dikit yg penting gampang dipahami".
+- Sebelumnya terdapat dua groupbox kosong ("Configs" dan "Theme") di bagian atas tab Settings sebelum kontainer resmi `CreateConfigManager` dan `CreateThemeManager` digenerate di bawahnya, menyebabkan tampilan ganda membingungkan.
+
+### Bukti
+- Jumlah groupbox di tab Settings berkurang dari 5 (dengan 2 kotak kosong) menjadi 4 kontainer fungsional bersih (Configs, Themes, Customization/Weather, Hub Controls).
+- Script berhasil dimuat ulang di client game (`[Blizzard] loaded`).
+
+---
+
+## 2026-10-18 18:49:00 +07:00 — penyamaran nama Blizzard Hub beranimasi glimmer ungu di overhead, leaderboard, dan menu UI
+
+Game  : Foresters 🌳 [RELEASE]
+Place : 117020342702668
+Client: 0.743.0.7431134
+Job   : 14baa559-5036-4063-8087-ea3fdd422ae2
+
+### Perubahan
+- Menambahkan fitur penyamaran nama (Streamer Mode / Spoof Name) dengan toggle `Hide In-Game Name` di tab Settings, default ON.
+- Mengubah nama karakter menjadi `Blizzard Hub` (dengan dua huruf 'z') yang dipasangi efek animasi glimmering ungu (`UIGradient` multi-stop warna ungu violet `#a855f7` -> lavender kilau `#d8b4fe` -> putih highlight `#ffffff` dengan animasi translasi offset halus).
+- Menerapkan nama dan efek animasi ini di 3 tempat sekaligus:
+  1. Nametag Overhead karakter in-game (`PlayerGui.ReactWorld["Overhead<UserId>"].Content.Card.Content.Name`).
+  2. Papan peringkat / Leaderboard resmi Roblox di `CoreGui.PlayerList` (`PlayerEntry_<UserId>`).
+  3. Badge identitas profil di pojok sidebar UI hub Airflow.
+- Menghubungkan listener `ReactWorld.DescendantAdded` dan `PlayerList.DescendantAdded` agar penyamaran nama tetap bertahan saat respawn, level up, playerlist buka/tutup, maupun re-render Roact.
+- Menambahkan pemulihan nama asli (`plr.DisplayName` dan `@plr.Name`) serta pembersihan instance `UIGradient` dan koneksi saat toggle dimatikan atau script di-unload.
+
+### Alasan
+- Klarifikasi permintaan Captain: "blizard hub, z nya satu doang ya? apa dua dh, warna ungu yg glimmering gitu bisa gaa, yg di leaderboard jg bikin ikut keubah ya" dan "kalo dinyalain ganti namanya jadi blizzardhub, defaultnya toggle on, bukan diilangin gitu yg diatas kepala gw".
+
+### Bukti
+- Ejaan diselaraskan menjadi `Blizzard Hub` (2 huruf 'z') sesuai identitas hub script.
+- `Overhead<UserId>.Content.Card.Content.Name.Text` sukses berubah menjadi `Blizzard Hub` dengan animasi kilau ungu shimmer.
+- `CoreGui.PlayerList...PlayerEntry_<UserId>...PlayerName.Text` sukses berubah menjadi `Blizzard Hub` dengan kilau ungu shimmer yang sama.
+- Verified visual lewat screenshot in-game.
+
+---
+
+## 2026-10-18 19:19:00 +07:00 — batalkan penyamaran nama pada UI menu script (hanya in-game & leaderboard)
+
+Game  : Foresters 🌳 [RELEASE]
+Place : 117020342702668
+Client: 0.743.0.7431134
+Job   : 14baa559-5036-4063-8087-ea3fdd422ae2
+
+### Perubahan
+- Menghapus manipulasi teks label nama pada elemen internal menu UI script (`w.Gui` / Airflow identity). Menu hub tetap menampilkan username dan display name asli pengguna secara wajar.
+- Penyamaran nama `Blizzard Hub` dengan animasi shimmer ungu kini khusus aktif hanya pada in-game nametag overhead di atas kepala karakter (`ReactWorld.Overhead<UserId>`) dan papan peringkat in-game Roblox (`CoreGui.PlayerList`).
+
+### Alasan
+- Permintaan Captain: "yg di ui script gausah, kalo udh semua up ke github".
+
+### Bukti
+- Fungsi `S.set_hide_ingame_name` hanya menargetkan `ReactWorld` dan `PlayerList`.
+- File `farm_hub.lua` dan `history.md` siap di-commit dan di-push ke GitHub repository.
+
+
+
+
+

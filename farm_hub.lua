@@ -66,11 +66,57 @@ do
 		end
 	end
 	pcall(function()
+		if getgenv().__OldWindupPower and ChopTuning then
+			ChopTuning.WindupPower = getgenv().__OldWindupPower
+			getgenv().__OldWindupPower = nil
+		end
 		local state = getgenv().__BlizzardPerfHook
 		if state and type(state.old) == "function" then
 			TreeService.FinishChop = state.old
 		end
 		getgenv().__BlizzardPerfHook = nil
+		if getgenv().__BlizzardHideOverheadConn then
+			pcall(function() getgenv().__BlizzardHideOverheadConn:Disconnect() end)
+			getgenv().__BlizzardHideOverheadConn = nil
+		end
+		if getgenv().__BlizzardHideOverheadPropConn then
+			pcall(function() getgenv().__BlizzardHideOverheadPropConn:Disconnect() end)
+			getgenv().__BlizzardHideOverheadPropConn = nil
+		end
+		if getgenv().__BlizzardHideLeaderboardConn then
+			pcall(function() getgenv().__BlizzardHideLeaderboardConn:Disconnect() end)
+			getgenv().__BlizzardHideLeaderboardConn = nil
+		end
+		local pgui = plr:FindFirstChild("PlayerGui")
+		local rw = pgui and pgui:FindFirstChild("ReactWorld")
+		local tag = rw and rw:FindFirstChild("Overhead" .. tostring(plr.UserId))
+		if tag and tag:IsA("BillboardGui") then
+			pcall(function()
+				tag.Enabled = true
+				local card = tag:FindFirstChild("Content") and tag.Content:FindFirstChild("Card")
+				local content = card and card:FindFirstChild("Content")
+				local nameLabel = content and content:FindFirstChild("Name")
+				if nameLabel and nameLabel:IsA("TextLabel") then
+					local g = nameLabel:FindFirstChild("BlizzardGlimmer")
+					if g then g:Destroy() end
+					nameLabel.TextColor3 = Color3.fromRGB(232, 232, 232)
+					nameLabel.Text = plr.DisplayName
+				end
+			end)
+		end
+		local cg = game:GetService("CoreGui")
+		local pl = cg:FindFirstChild("PlayerList")
+		local entry = pl and pl:FindFirstChild("PlayerEntry_" .. tostring(plr.UserId), true)
+		local pNameFrame = entry and entry:FindFirstChild("PlayerName", true)
+		local leadLabel = pNameFrame and pNameFrame:FindFirstChildOfClass("TextLabel")
+		if leadLabel then
+			pcall(function()
+				local g = leadLabel:FindFirstChild("BlizzardGlimmer")
+				if g then g:Destroy() end
+				leadLabel.TextColor3 = Color3.fromRGB(247, 247, 248)
+				leadLabel.Text = plr.DisplayName
+			end)
+		end
 	end)
 	if prev and prev.window and typeof(prev.window) ~= "nil" then
 		pcall(function() prev.window:Destroy() end)
@@ -118,6 +164,7 @@ S.perfectOn = S.perfectOn or false
 S.autoSell = S.autoSell or false
 S.sellAt = S.sellAt or 50
 S.logCount = S.logCount or 0
+if S.hideIngameName == nil then S.hideIngameName = true end
 S.esp = S.esp or {}
 -- farm filter: only chop trees at or above this rarity tier
 if type(S.minTier) ~= "number" then S.minTier = 0 end
@@ -129,20 +176,10 @@ S.weightValue = type(S.weightValue) == "number" and S.weightValue or 0.6
 S.includeGrowing = S.includeGrowing == true
 S.sameIslandOnly = S.sameIslandOnly ~= false
 -- *movement modes:
---   walk       — Humanoid:MoveTo along a PathfindingService route. Server-legal, slow.
---   teleport   — CFrame displacement. Snaps back on long runs.
---   respawn    — kill, then teleport inside the post-spawn window. The server is
---                placing a fresh character and has no position baseline to compare
---                against, so the jump becomes its starting position. Verified: 1248
---                studs held 4.7s with no snapback, 4/5 trials, failures were only
---                wrong ground Y.*
-S.moveMode = (S.moveMode == "teleport" or S.moveMode == "respawn") and S.moveMode or "walk"
-S.walkSpeed = tonumber(S.walkSpeed) or 32
-S.walkTeleportBeyond = tonumber(S.walkTeleportBeyond) or 400
-S.walkStripMap = S.walkStripMap ~= false
-S.walkTimeout = tonumber(S.walkTimeout) or 45
-S.walkAllowTeleportFallback = S.walkAllowTeleportFallback == true
-S.respawnDelay = tonumber(S.respawnDelay) or 0.15
+--   respawn    — kill, then teleport inside the post-spawn window (verified: 1248 studs held).
+--   bike       — bike mounting animation transit bypass (WIP).
+S.moveMode = (S.moveMode == "bike") and "bike" or "respawn"
+S.respawnDelay = 0.15
 do
 	local e = S.esp
 	e.players = e.players or false
@@ -233,9 +270,7 @@ end
 
 local SNAP_STEP = 15
 local SNAP_PAUSE = 0.05
-local HUG_OFFSET = 3.5
 local STAND_HEIGHT = 0.5
-local attachYaw = 0
 
 -- *WALK MODE — the reliable path.
 --
@@ -431,6 +466,120 @@ function WALK.respawnJump(dest)
 		end
 	end
 
+	return held, held and "landed" or "drifted"
+end
+
+-- *BIKE-TP (WIP): transit bypass using bike mount animation.
+-- Exploits server authority handoff during VehicleSeat mounting.*
+function WALK.bikeJump(dest)
+	local char = plr.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not (root and hum) then return false, "no character" end
+
+	local rp = RaycastParams.new()
+	rp.FilterType = Enum.RaycastFilterType.Exclude
+	rp.FilterDescendantsInstances = {char, workspace.Map:FindFirstChild("Trees")}
+	local g = workspace:Raycast(Vector3.new(dest.X, dest.Y + 200, dest.Z), Vector3.new(0, -400, 0), rp)
+	if not g then return false, "no ground at destination" end
+	local landPos = Vector3.new(dest.X, g.Position.Y + 3.0, dest.Z)
+	local landCF = CFrame.new(landPos)
+
+	local okBgs, bgs = pcall(function() return Knit.GetService("BikeGarageService") end)
+	local okBs, bs = pcall(function() return Knit.GetService("BikeService") end)
+
+	if hum.Sit then
+		hum.Sit = false
+		pcall(function() hum:ChangeState(Enum.HumanoidStateType.GettingUp) end)
+		task.wait(0.2)
+	end
+
+	local bikeTool = nil
+	if char then
+		for _, c in ipairs(char:GetChildren()) do
+			if c:IsA("Tool") and (c:GetAttribute("BikeId") or c.Name:lower():match("bike")) then
+				bikeTool = c
+				break
+			end
+		end
+	end
+	if not bikeTool then
+		local bp = plr:FindFirstChild("Backpack")
+		if bp then
+			for _, c in ipairs(bp:GetChildren()) do
+				if c:IsA("Tool") and (c:GetAttribute("BikeId") or c.Name:lower():match("bike")) then
+					bikeTool = c
+					break
+				end
+			end
+		end
+	end
+
+	local bikeId = bikeTool and (bikeTool:GetAttribute("BikeId") or bikeTool.Name) or "MountainBike"
+	if okBgs and bgs and bgs.Summon then
+		pcall(function() bgs:Summon(bikeId) end)
+	elseif bikeTool and hum then
+		pcall(function() hum:EquipTool(bikeTool) end)
+	end
+
+	local bikes = workspace:FindFirstChild("Bikes")
+	local myBike = nil
+	local t0 = os.clock()
+	while os.clock() - t0 < 2.5 do
+		if bikes then
+			for _, b in ipairs(bikes:GetChildren()) do
+				if b:GetAttribute("Owner") == plr.UserId then
+					myBike = b
+					break
+				end
+			end
+		end
+		if myBike then break end
+		task.wait(0.05)
+	end
+	if not myBike then return false, "bike spawn timeout" end
+
+	local token = myBike:GetAttribute("Token")
+	local chassis = myBike:FindFirstChild("Chassis") or myBike.PrimaryPart
+	local seat = myBike:FindFirstChild("Seat")
+
+	task.spawn(function()
+		if okBs and bs and bs.Ride and token then
+			pcall(function() bs:Ride(token) end)
+		elseif seat and (seat:IsA("Seat") or seat:IsA("VehicleSeat")) then
+			pcall(function() seat:Sit(hum) end)
+		end
+	end)
+
+	task.wait(0.04)
+	for _ = 1, 4 do
+		if chassis then
+			chassis.CFrame = landCF
+			chassis.AssemblyLinearVelocity = Vector3.zero
+		end
+		if root then
+			root.CFrame = landCF
+			root.AssemblyLinearVelocity = Vector3.zero
+		end
+		task.wait(0.03)
+	end
+
+	task.wait(0.12)
+	if hum.Sit then
+		hum.Sit = false
+		pcall(function() hum:ChangeState(Enum.HumanoidStateType.GettingUp) end)
+	end
+	if okBs and bs and bs.PutAway then
+		pcall(function() bs:PutAway() end)
+	end
+
+	if root then
+		root.CFrame = landCF
+		root.AssemblyLinearVelocity = Vector3.zero
+	end
+	task.wait(0.1)
+
+	local held = root and (root.Position - landPos).Magnitude <= 40
 	return held, held and "landed" or "drifted"
 end
 
@@ -634,43 +783,6 @@ local function teleport_to(pos, offset, finalFacing)
 	local delta = dest - from
 	local dist = delta.Magnitude
 
-	-- *movement dispatcher. respawn is the strongest bypass but costs a death each
-	-- time, so it is opt-in. walk is the default because it is server-legal and free.
-	-- The raw teleport is the last resort and is never chosen automatically.*
-	if S.moveMode == "respawn" then
-		local okR, whyR = WALK.respawnJump(dest)
-		if okR then
-			if finalFacing then
-				local r2 = hrp()
-				if r2 then r2.CFrame = CFrame.new(r2.Position) * (finalFacing - finalFacing.Position) end
-			end
-			return true
-		end
-		return false, "respawn jump failed: " .. tostring(whyR)
-	end
-
-	if S.moveMode ~= "teleport" then
-		local beyond = tonumber(S.walkTeleportBeyond) or 400
-		if dist <= beyond then
-			local okW, whyW = WALK.go(dest)
-			if okW then
-				if finalFacing then
-					local r2 = hrp()
-					if r2 then r2.CFrame = CFrame.new(r2.Position) * (finalFacing - finalFacing.Position) end
-				end
-				return true
-			end
-			-- *walk failed: fall through to the teleport only if the player allowed it,
-			-- otherwise report the walk error so the caller can pick another tree*
-			if S.walkAllowTeleportFallback ~= true then
-				return false, "walk failed: " .. tostring(whyW)
-			end
-		end
-	end
-
-	if dist > 900 then
-		return false, "distance too far"
-	end
 	if dist <= 8 then
 		root.CFrame = finalFacing or CFrame.new(dest)
 		root.AssemblyLinearVelocity = Vector3.zero
@@ -679,89 +791,104 @@ local function teleport_to(pos, offset, finalFacing)
 		return true
 	end
 
-	local char = plr.Character
-	local hum = char and char:FindFirstChildOfClass("Humanoid")
-	local rayParams = RaycastParams.new()
-	rayParams.FilterType = Enum.RaycastFilterType.Exclude
-	rayParams.FilterDescendantsInstances = {char}
-
-	local flatDelta = Vector3.new(dest.X - from.X, 0, dest.Z - from.Z)
-	local travelRot = (flatDelta.Magnitude > 0.1) and (CFrame.lookAt(Vector3.zero, flatDelta) - Vector3.zero) or (root.CFrame - root.Position)
-
-	-- *freeze the humanoid and anchor the root: the assembly stays welded, the
-	-- solver stops touching it, and CFrame writes move the whole character.*
-	if hum then pcall(function() hum.PlatformStand = true end) end
-	root.Anchored = true
-	task.wait(0.05)
-
-	local legs = math.max(1, math.ceil(dist / CHUNK_STUDS))
-	local legStart = from
-	local aborted = false
-
-	for leg = 1, legs do
-		if not alive() then aborted = true break end
-		local frac = leg / legs
-		local legEnd = Vector3.new(
-			from.X + (dest.X - from.X) * frac,
-			from.Y + (dest.Y - from.Y) * frac,
-			from.Z + (dest.Z - from.Z) * frac
-		)
-
-		wait_for_stream(legEnd)
-
-		local legDelta = legEnd - legStart
-		local legDist = legDelta.Magnitude
-		local legSteps = math.max(1, math.ceil((legDist / MOVE_SPEED) / 0.04))
-
-		for i = 1, legSteps do
-			if not alive() then aborted = true break end
-			local f = i / legSteps
-			local curX = legStart.X + legDelta.X * f
-			local curZ = legStart.Z + legDelta.Z * f
-			local ray = workspace:Raycast(Vector3.new(curX, legStart.Y + 20, curZ), Vector3.new(0, -60, 0), rayParams)
-			local curY = ray and (ray.Position.Y + 3.0) or (legStart.Y + legDelta.Y * f)
-
-			root.CFrame = CFrame.new(curX, curY, curZ) * travelRot
-			task.wait(0.04)
+	if S.moveMode == "bike" then
+		local okB, whyB = WALK.bikeJump(dest)
+		if okB then
+			if finalFacing then
+				local r2 = hrp()
+				if r2 then r2.CFrame = CFrame.new(r2.Position) * (finalFacing - finalFacing.Position) end
+			end
+			return true
 		end
-		if aborted then break end
+		-- Fall back to Respawn TP so farming is never blocked
+		local okR, whyR = WALK.respawnJump(dest)
+		if okR then
+			if finalFacing then
+				local r2 = hrp()
+				if r2 then r2.CFrame = CFrame.new(r2.Position) * (finalFacing - finalFacing.Position) end
+			end
+			return true
+		end
+		return false, "bike/respawn failed: " .. tostring(whyB)
+	else
+		local okR, whyR = WALK.respawnJump(dest)
+		if okR then
+			if finalFacing then
+				local r2 = hrp()
+				if r2 then r2.CFrame = CFrame.new(r2.Position) * (finalFacing - finalFacing.Position) end
+			end
+			return true
+		end
+	end
+end
 
-		legStart = legEnd
-		task.wait(0.06)
+local function get_tree_stand(tree, fromPos, forceRandom)
+	local base = tree:GetPivot()
+	local basePos = base.Position
+	local trunkWidth = tonumber(tree:GetAttribute("TrunkWidth"))
+	local trunkRadius = 2.0
+	if trunkWidth and trunkWidth > 0 then
+		trunkRadius = trunkWidth / 2
+	else
+		local trunk = tree:FindFirstChild("Trunk") or tree:FindFirstChild("Wood") or tree.PrimaryPart
+		if trunk and trunk:IsA("BasePart") then
+			trunkRadius = math.max(trunk.Size.X, trunk.Size.Z) / 2
+		end
+	end
+	-- Safe clearance: outside the collision radius by +3.2 studs (prevents clipping into trunk/roots)
+	-- Clamped between 4.5 and 10.5 studs so it is always within ChopTuning reach (reach is 11-17 studs)
+	local safeDist = math.clamp(trunkRadius + 3.2, 4.5, 10.5)
+
+	local dir
+	if forceRandom then
+		local ang = math.random() * math.pi * 2
+		dir = Vector3.new(math.cos(ang), 0, math.sin(ang))
+	elseif fromPos then
+		local delta = fromPos - basePos
+		local flat = Vector3.new(delta.X, 0, delta.Z)
+		if flat.Magnitude > 0.5 then
+			dir = flat.Unit
+		end
+	end
+	if not dir then
+		dir = (base.LookVector * Vector3.new(1, 0, 1)).Unit
+		if dir.Magnitude < 0.1 then dir = Vector3.new(0, 0, 1) end
 	end
 
-	if not aborted then
-		-- *land exactly on the surface*
-		local landRay = workspace:Raycast(Vector3.new(dest.X, dest.Y + 60, dest.Z), Vector3.new(0, -180, 0), rayParams)
-		local landY = landRay and (landRay.Position.Y + 3.0) or dest.Y
-		local landRot = finalFacing and (finalFacing - finalFacing.Position) or travelRot
-		root.CFrame = CFrame.new(Vector3.new(dest.X, landY, dest.Z)) * landRot
-		root.AssemblyLinearVelocity = Vector3.zero
-		root.AssemblyAngularVelocity = Vector3.zero
-		task.wait(0.08)
-	end
-
-	-- *release: unanchor, restore collision, hand control back to the humanoid*
-	root.Anchored = false
-	restore_collide()
-	if hum then
-		pcall(function() hum.PlatformStand = false end)
-		pcall(function() hum:ChangeState(Enum.HumanoidStateType.GettingUp) end)
-	end
-	task.wait(0.3)
-	return not aborted
+	local standPos = basePos + dir * safeDist
+	local facing = CFrame.lookAt(Vector3.new(standPos.X, basePos.Y + STAND_HEIGHT, standPos.Z), basePos)
+	return standPos, facing, safeDist
 end
 
 local function attach(tree, anchor, reroll)
 	local root = hrp()
 	if not root or not tree or not tree.Parent then return end
-	if reroll then attachYaw = math.random() * math.pi * 2 end
 	local base = tree:GetPivot()
-	local stand = base * (CFrame.Angles(0, attachYaw, 0) * CFrame.new(0, STAND_HEIGHT, HUG_OFFSET))
-	local facing = CFrame.lookAt(stand.Position, base.Position)
-	local dist = (stand.Position - root.Position).Magnitude
-	if dist > 8 then
-		teleport_to(stand.Position, Vector3.zero, facing)
+	local basePos = base.Position
+
+	local standPos, facing, safeDist = get_tree_stand(tree, root.Position, reroll)
+
+	-- If the character is ALREADY at this tree within chopping reach and clear of trunk, do NOT re-teleport/respawn
+	local curDelta = root.Position - basePos
+	local curDistHoriz = Vector3.new(curDelta.X, 0, curDelta.Z).Magnitude
+	local reach = 12.0
+	pcall(function()
+		if ChopTuning and ChopTuning.ReachOf then
+			reach = ChopTuning.ReachOf(tree) or 12.0
+		end
+	end)
+
+	if not reroll and curDistHoriz <= reach and curDistHoriz >= math.max(safeDist - 2.0, 2.5) and math.abs(root.Position.Y - basePos.Y) < 18 then
+		root.Anchored = false
+		root.CFrame = CFrame.lookAt(root.Position, Vector3.new(basePos.X, root.Position.Y, basePos.Z))
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+		return
+	end
+
+	local dist = (standPos - root.Position).Magnitude
+	if dist > 8 or reroll then
+		teleport_to(standPos, Vector3.zero, facing)
 	else
 		root.Anchored = false
 		root.CFrame = facing
@@ -1674,7 +1801,7 @@ local function settle_on_ground()
 	end
 	local rp = RaycastParams.new()
 	rp.FilterType = Enum.RaycastFilterType.Exclude
-	rp.FilterDescendantsInstances = {char}
+	rp.FilterDescendantsInstances = {char, workspace.Map:FindFirstChild("Trees")}
 	local pos = root.Position
 	local ray = workspace:Raycast(Vector3.new(pos.X, pos.Y + 80, pos.Z), Vector3.new(0, -220, 0), rp)
 	if ray and (ray.Position.Y + 3.2) > pos.Y + 1.5 then
@@ -1688,7 +1815,7 @@ end
 local function chop_tree(tree)
 	if not tree or not tree.Parent then return false, "tree gone" end
 	ensure_axe_for_chop()
-	attach(tree, true, true)
+	attach(tree, true, false)
 	ensure_axe_for_chop()
 	settle_on_ground()
 
@@ -1722,9 +1849,10 @@ local function chop_tree(tree)
 	local vp = cam and cam:WorldToViewportPoint(trunkPos) or Vector3.new(200, 200, 0)
 	local screenPos = Vector2.new(vp.X, vp.Y) - GuiService:GetGuiInset()
 
-	-- Windup & release
+	-- Windup & release (full 100% perfect windup)
 	ChopController:BeginWindup(axeTool, screenPos)
-	task.wait(0.4)
+	local fillSec = (ChopTuning and tonumber(ChopTuning.WindupFillSeconds)) or 0.65
+	task.wait(fillSec)
 	ChopController:ReleaseWindup()
 
 	-- Wait for session to be established
@@ -1827,6 +1955,32 @@ local function equipped_axe()
 	return nil
 end
 
+local AXE_FALLBACK_COORDS = {
+	IronAxe = Vector3.new(-114.5, 24.5, -512.0),
+	Hatchet = Vector3.new(-100.4, 23.7, -508.7),
+	SteelAxe = Vector3.new(649.5, 6.5, -595.0),
+	RangersAxe = Vector3.new(647.8, 5.9, -596.8),
+	GoldenAxe = Vector3.new(192.0, 12.2, -47.6),
+	DriftwoodAxe = Vector3.new(191.3, 11.3, -50.4),
+	ProspectorsAxe = Vector3.new(-552.4, 11.6, 299.7),
+	ThunderheadAxe = Vector3.new(-59.2, 27.5, -584.6),
+	TimberAxe = Vector3.new(26.0, 7.5, -1038.4),
+}
+
+local function fmt_price(n)
+	n = tonumber(n) or 0
+	if n >= 1e6 then
+		local m = n / 1e6
+		if m == math.floor(m) then return ("$%dm"):format(m) end
+		return ("$%.1fm"):format(m):gsub("%.0m", "m")
+	elseif n >= 1e3 then
+		local k = n / 1e3
+		if k == math.floor(k) then return ("$%dk"):format(k) end
+		return ("$%.1fk"):format(k):gsub("%.0k", "k")
+	end
+	return ("$%d"):format(n)
+end
+
 local function axe_ladder()
 	local shops = {}
 	for _, prompt in ipairs(CS:GetTagged("AxeView")) do
@@ -1838,16 +1992,18 @@ local function axe_ladder()
 	end
 	local list = {}
 	for id, cfg in pairs(AxeConfig) do
-		if type(cfg) == "table" and shops[id] then
+		local shopPos = shops[id] or AXE_FALLBACK_COORDS[id]
+		if type(cfg) == "table" and shopPos then
 			local ok, price = pcall(function() return AxePrice.For(id, {}) end)
 			table.insert(list, {
 				id = id,
 				name = tostring(cfg.DisplayName or id),
 				price = ok and price or (cfg.Price or 0),
+				level = cfg.Level or 1,
 				power = cfg.Power or 0,
 				speed = cfg.Speed or 0,
 				luck = cfg.Luck or 0,
-				pos = shops[id],
+				pos = shopPos,
 			})
 		end
 	end
@@ -1861,16 +2017,8 @@ local function bucks()
 	return b and b.Value or 0
 end
 
-local function travel_to(pos)
-	local root = hrp()
-	if not root then return end
-	root.CFrame = CFrame.new(pos + Vector3.new(0, 3, 4))
-	root.AssemblyLinearVelocity = Vector3.zero
-	task.wait(0.5)
-end
-
 local function buy_axe(axe)
-	travel_to(axe.pos)
+	teleport_to(axe.pos, Vector3.new(0, 3, 4))
 	local res = call(AxeService, "BuyAxe", axe.id)
 	if type(res) == "table" and res.Ok then
 		call(AxeService, "EquipAxe", axe.id)
@@ -1903,6 +2051,230 @@ local BLIZZARD_SCHEME = {
 pcall(function() Airflow:SetTheme(BLIZZARD_SCHEME) end)
 pcall(function() Airflow:SetDefaultTheme(BLIZZARD_SCHEME) end)
 
+local VISUAL = {
+	fpsBoost = false,
+	ultraFps = false,
+	superUltraFps = false,
+}
+
+function VISUAL.setFpsBoost(on)
+	VISUAL.fpsBoost = on
+	local Lighting = game:GetService("Lighting")
+	if on then
+		pcall(function()
+			Lighting.GlobalShadows = false
+			Lighting.FogEnd = 9e9
+			Lighting.ShadowSoftness = 0
+			for _, v in ipairs(Lighting:GetChildren()) do
+				if v:IsA("PostEffect") or v:IsA("Atmosphere") or v:IsA("Sky") then
+					v.Enabled = false
+				end
+			end
+			local terrain = workspace:FindFirstChildOfClass("Terrain")
+			if terrain then
+				terrain.Decoration = false
+				terrain.WaterWaveSize = 0
+				terrain.WaterWaveSpeed = 0
+				terrain.WaterReflectance = 0
+			end
+		end)
+	else
+		pcall(function()
+			Lighting.GlobalShadows = true
+			Lighting.FogEnd = 1000
+			for _, v in ipairs(Lighting:GetChildren()) do
+				if v:IsA("PostEffect") or v:IsA("Atmosphere") or v:IsA("Sky") then
+					v.Enabled = true
+				end
+			end
+		end)
+	end
+end
+
+function VISUAL.setUltraFps(on)
+	VISUAL.ultraFps = on
+	VISUAL.setFpsBoost(on)
+	if on then
+		pcall(function()
+			for _, d in ipairs(workspace:GetDescendants()) do
+				if d:IsA("ParticleEmitter") or d:IsA("Beam") or d:IsA("Trail")
+					or d:IsA("Fire") or d:IsA("Smoke") or d:IsA("Sparkles") then
+					d.Enabled = false
+				elseif d:IsA("Decal") or d:IsA("Texture") then
+					d.Transparency = 1
+				elseif d:IsA("BasePart") then
+					d.CastShadow = false
+					d.Material = Enum.Material.SmoothPlastic
+					d.Reflectance = 0
+				end
+			end
+		end)
+	else
+		pcall(function()
+			for _, d in ipairs(workspace:GetDescendants()) do
+				if d:IsA("Decal") or d:IsA("Texture") then
+					d.Transparency = 0
+				end
+			end
+		end)
+	end
+end
+
+function VISUAL.setSuperUltraFps(on)
+	VISUAL.superUltraFps = on
+	VISUAL.setUltraFps(on)
+	if on then
+		pcall(function()
+			pcall(function() settings().Rendering.QualityLevel = 1 end)
+			local Lighting = game:GetService("Lighting")
+			Lighting.Brightness = 2
+			Lighting.ClockTime = 14
+			Lighting.Ambient = Color3.fromRGB(150, 150, 150)
+			Lighting.OutdoorAmbient = Color3.fromRGB(150, 150, 150)
+			for _, d in ipairs(workspace:GetDescendants()) do
+				if d:IsA("MeshPart") then
+					d.RenderFidelity = Enum.RenderFidelity.Performance
+				end
+			end
+		end)
+	end
+end
+
+local SPOOF_NAME = "Blizzard Hub"
+
+local function apply_glimmer(lbl)
+	if not lbl or not lbl:IsA("TextLabel") then return end
+	lbl.TextColor3 = Color3.fromRGB(255, 255, 255)
+	local oldGrad = lbl:FindFirstChild("BlizzardGlimmer")
+	if oldGrad then pcall(function() oldGrad:Destroy() end) end
+
+	local grad = Instance.new("UIGradient")
+	grad.Name = "BlizzardGlimmer"
+	grad.Color = ColorSequence.new({
+		ColorSequenceKeypoint.new(0.0, Color3.fromRGB(168, 85, 247)),
+		ColorSequenceKeypoint.new(0.3, Color3.fromRGB(216, 180, 254)),
+		ColorSequenceKeypoint.new(0.5, Color3.fromRGB(255, 255, 255)),
+		ColorSequenceKeypoint.new(0.7, Color3.fromRGB(216, 180, 254)),
+		ColorSequenceKeypoint.new(1.0, Color3.fromRGB(168, 85, 247)),
+	})
+	grad.Offset = Vector2.new(-1, 0)
+	grad.Parent = lbl
+
+	local tw = game:GetService("TweenService"):Create(
+		grad,
+		TweenInfo.new(2, Enum.EasingStyle.Linear, Enum.EasingDirection.InOut, -1, false),
+		{Offset = Vector2.new(1, 0)}
+	)
+	tw:Play()
+end
+
+local function remove_glimmer(lbl, origColor)
+	if not lbl or not lbl:IsA("TextLabel") then return end
+	local oldGrad = lbl:FindFirstChild("BlizzardGlimmer")
+	if oldGrad then pcall(function() oldGrad:Destroy() end) end
+	if origColor then lbl.TextColor3 = origColor end
+end
+
+function S.set_hide_ingame_name(on)
+	S.hideIngameName = on
+	local targetName = on and SPOOF_NAME or plr.DisplayName
+
+	-- 1. Overhead Nametag (BillboardGui in ReactWorld)
+	local function apply_overhead()
+		local pgui = plr:FindFirstChild("PlayerGui")
+		local rw = pgui and pgui:FindFirstChild("ReactWorld")
+		local tag = rw and rw:FindFirstChild("Overhead" .. tostring(plr.UserId))
+		if tag and tag:IsA("BillboardGui") then
+			tag.Enabled = true
+			local card = tag:FindFirstChild("Content") and tag.Content:FindFirstChild("Card")
+			local content = card and card:FindFirstChild("Content")
+			local nameLabel = content and content:FindFirstChild("Name")
+			if nameLabel and nameLabel:IsA("TextLabel") then
+				if on then
+					nameLabel.Text = targetName
+					apply_glimmer(nameLabel)
+					if not getgenv().__BlizzardHideOverheadPropConn then
+						getgenv().__BlizzardHideOverheadPropConn = nameLabel:GetPropertyChangedSignal("Text"):Connect(function()
+							if S.hideIngameName and nameLabel.Text ~= SPOOF_NAME then
+								nameLabel.Text = SPOOF_NAME
+							end
+						end)
+					end
+				else
+					if getgenv().__BlizzardHideOverheadPropConn then
+						pcall(function() getgenv().__BlizzardHideOverheadPropConn:Disconnect() end)
+						getgenv().__BlizzardHideOverheadPropConn = nil
+					end
+					remove_glimmer(nameLabel, Color3.fromRGB(232, 232, 232))
+					nameLabel.Text = targetName
+				end
+			end
+		end
+	end
+
+	pcall(apply_overhead)
+
+	-- 2. ReactWorld listener for overhead remounts
+	local pgui = plr:FindFirstChild("PlayerGui")
+	local rw = pgui and pgui:FindFirstChild("ReactWorld")
+	if on then
+		if not getgenv().__BlizzardHideOverheadConn and rw then
+			getgenv().__BlizzardHideOverheadConn = rw.DescendantAdded:Connect(function(desc)
+				if S.hideIngameName and desc:IsA("TextLabel") and desc.Name == "Name" then
+					local tag = rw:FindFirstChild("Overhead" .. tostring(plr.UserId))
+					if tag and desc:IsDescendantOf(tag) then
+						task.defer(apply_overhead)
+					end
+				end
+			end)
+		end
+	else
+		if getgenv().__BlizzardHideOverheadConn then
+			pcall(function() getgenv().__BlizzardHideOverheadConn:Disconnect() end)
+			getgenv().__BlizzardHideOverheadConn = nil
+		end
+	end
+
+	-- 3. Leaderboard / PlayerList (CoreGui)
+	local function apply_leaderboard()
+		local cg = game:GetService("CoreGui")
+		local pl = cg:FindFirstChild("PlayerList")
+		if not pl then return end
+		local entry = pl:FindFirstChild("PlayerEntry_" .. tostring(plr.UserId), true)
+		local pNameFrame = entry and entry:FindFirstChild("PlayerName", true)
+		local leadLabel = pNameFrame and pNameFrame:FindFirstChildOfClass("TextLabel")
+		if leadLabel then
+			if on then
+				leadLabel.Text = targetName
+				apply_glimmer(leadLabel)
+			else
+				remove_glimmer(leadLabel, Color3.fromRGB(247, 247, 248))
+				leadLabel.Text = targetName
+			end
+		end
+	end
+
+	pcall(apply_leaderboard)
+
+	-- 4. CoreGui PlayerList listener for when leaderboard is opened or players change
+	local cg = game:GetService("CoreGui")
+	local pl = cg:FindFirstChild("PlayerList")
+	if on then
+		if not getgenv().__BlizzardHideLeaderboardConn and pl then
+			getgenv().__BlizzardHideLeaderboardConn = pl.DescendantAdded:Connect(function(desc)
+				if S.hideIngameName and desc.Name == ("PlayerEntry_" .. tostring(plr.UserId)) then
+					task.defer(apply_leaderboard)
+				end
+			end)
+		end
+	else
+		if getgenv().__BlizzardHideLeaderboardConn then
+			pcall(function() getgenv().__BlizzardHideLeaderboardConn:Disconnect() end)
+			getgenv().__BlizzardHideLeaderboardConn = nil
+		end
+	end
+end
+
 local Window = Airflow:CreateWindow({
 	Name = "Blizzard Hub",
 	LoadingSubtitle = "Foresters",
@@ -1919,29 +2291,25 @@ S.window = Window
 
 local farmTab = Window:CreateTab({Name = "Farm", Icon = "tree-pine"})
 local axeTab = Window:CreateTab({Name = "Axes", Icon = "axe"})
-local legitTab = Window:CreateTab({Name = "Legit", Icon = "shield"})
-local espTab = Window:CreateTab({Name = "ESP", Icon = "eye"})
+local visualTab = Window:CreateTab({Name = "Visual", Icon = "eye"})
+local panicTab = Window:CreateTab({Name = "Panic", Icon = "shield-alert"})
 local settingsTab = Window:CreateTab({Name = "Settings", Icon = "settings"})
 
-local gbConfig = settingsTab:CreateGroupbox({Name = "Configs", Side = "Left"})
-local gbTheme = settingsTab:CreateGroupbox({Name = "Theme", Side = "Right"})
-
--- *balanced columns: five groupboxes used to stack down the left and the right
--- column sat nearly empty, which is what made the window look lopsided*
 local gbTop = farmTab:CreateGroupbox({Name = "Top wood", Side = "Left"})
 local gbFarm = farmTab:CreateGroupbox({Name = "Farming", Side = "Left"})
 local gbSession = farmTab:CreateGroupbox({Name = "Session", Side = "Right"})
-local gbServer = farmTab:CreateGroupbox({Name = "Server", Side = "Right"})
-local gbQuest = farmTab:CreateGroupbox({Name = "Quests", Side = "Right"})
+local gbMove = farmTab:CreateGroupbox({Name = "Movement", Side = "Right"})
 
 local gbAxes = axeTab:CreateGroupbox({Name = "Shop", Side = "Left"})
 local gbLadder = axeTab:CreateGroupbox({Name = "Buy ladder", Side = "Right"})
 local gbUtil = axeTab:CreateGroupbox({Name = "Utilities", Side = "Left"})
 
-local gbPerfect = legitTab:CreateGroupbox({Name = "Perfect", Side = "Left"})
+local gbVisualPerf = visualTab:CreateGroupbox({Name = "Performance", Side = "Left"})
+local gbEsp = visualTab:CreateGroupbox({Name = "Overlay", Side = "Left"})
+local gbEspStyle = visualTab:CreateGroupbox({Name = "Style", Side = "Right"})
 
-local gbEsp = espTab:CreateGroupbox({Name = "Overlay", Side = "Left"})
-local gbEspStyle = espTab:CreateGroupbox({Name = "Style", Side = "Right"})
+local gbPanic = panicTab:CreateGroupbox({Name = "Panic Mode", Side = "Left"})
+local gbPanicStatus = panicTab:CreateGroupbox({Name = "Status", Side = "Right"})
 
 local stats = {felled = 0, failed = 0, startedAt = 0, blocked = {}}
 local modeIndex = 1
@@ -1979,7 +2347,8 @@ local okTop, errTop = pcall(function()
 					safe_set(topLabel, ("camping %s — %s"):format(woodName, fmt_remaining(grow_remaining(t))))
 					task.spawn(function()
 						local okP, felled, why = pcall(function()
-							local okTp, errTp = teleport_to(t:GetPivot().Position, Vector3.new(0, 1, 5))
+							local standPos, facing = get_tree_stand(t, hrp() and hrp().Position)
+							local okTp, errTp = teleport_to(standPos, Vector3.zero, facing)
 							if not okTp then
 								return false, errTp or "teleport blocked"
 							end
@@ -2010,9 +2379,8 @@ local okTop, errTop = pcall(function()
 				safe_set(topLabel, "sniping " .. woodName .. "…")
 				task.spawn(function()
 					local okP, felled, why = pcall(function()
-						-- *pivot, not Trunk.Position: the trunk can sit high on a tall model,
-						-- which put us 15.4 studs out and past the 14-stud ReachStuds*
-						local okTp, errTp = teleport_to(t:GetPivot().Position, Vector3.new(0, 1, 5))
+						local standPos, facing = get_tree_stand(t, hrp() and hrp().Position)
+						local okTp, errTp = teleport_to(standPos, Vector3.zero, facing)
 						if not okTp then
 							return false, errTp or "teleport blocked"
 						end
@@ -2056,26 +2424,9 @@ local stateLabel = gbFarm:CreateStatus({Name = "State", Style = "Dot", Value = "
 local targetLabel = gbFarm:CreateLabel("-")
 local countLabel = gbFarm:CreateStatus({Name = "Chopped", Style = "Row", Value = "0 / 0"})
 local rateLabel = gbFarm:CreateStatus({Name = "Rate", Style = "Row", Value = "0/min"})
-local panicLabel = gbFarm:CreateStatus({
-	Name = "Nearest",
-	Style = "Dot",
-	UpdateRate = 1,
-	Update = function()
-		if not S.panicOn then return "off", "Muted" end
-		local myRoot = hrp()
-		if not myRoot then return "no char", "Warning" end
-		local d, who = nearest_player_dist(myRoot.Position)
-		if d <= (S.panicRadius or 50) then
-			return ("! %s %dm"):format(who and who.DisplayName or "?", math.floor(d)), "Error"
-		end
-		return ("%dm"):format(math.floor(d)), "Success"
-	end,
-})
-
 local axeLabel = gbSession:CreateStatus({Name = "Axe", Style = "Row", Value = "-"})
 local buckLabel = gbSession:CreateStatus({Name = "Bucks", Style = "Row", Value = "$0"})
 local sellLabel = gbSession:CreateLabel("off")
-local questLabel = gbQuest:CreateLabel("-")
 
 local buyLabel = gbAxes:CreateStatus({Name = "Auto buy", Style = "Row", Value = "off"})
 local buyLogLabel = gbAxes:CreateLabel("-")
@@ -2110,10 +2461,10 @@ gbAxes:CreateStatus({
 			if not own[axe.id] then
 				local b = bucks()
 				if b >= axe.price then
-					return ("%s $%d ready"):format(axe.name, axe.price), "Success"
+					return ("%s %s Lv.%s ready"):format(axe.name, fmt_price(axe.price), tostring(axe.level or 1)), "Success"
 				end
-				return ("%s $%d · %d%% saved"):format(
-					axe.name, axe.price, math.floor(math.min(b / axe.price, 1) * 100)), "Warning"
+				return ("%s %s Lv.%s · %d%% saved"):format(
+					axe.name, fmt_price(axe.price), tostring(axe.level or 1), math.floor(math.min(b / axe.price, 1) * 100)), "Warning"
 			end
 		end
 		return "ladder complete", "Success"
@@ -2121,29 +2472,80 @@ gbAxes:CreateStatus({
 })
 local mikuLabel = gbUtil:CreateLabel("miku: not scanned yet")
 
-local perfLabel = gbPerfect:CreateStatus({Name = "Auto Perfect", Style = "Row", Value = "off"})
+local panicLabel = gbPanicStatus:CreateStatus({
+	Name = "Nearest",
+	Style = "Dot",
+	UpdateRate = 1,
+	Update = function()
+		if not S.panicOn then return "off", "Muted" end
+		local myRoot = hrp()
+		if not myRoot then return "no char", "Warning" end
+		local d, who = nearest_player_dist(myRoot.Position)
+		if d <= (S.panicRadius or 50) then
+			return ("! %s %dm"):format(who and who.DisplayName or "?", math.floor(d)), "Error"
+		end
+		return ("%dm"):format(math.floor(d)), "Success"
+	end,
+})
 
-gbPerfect:CreateToggle({
-	Name = "Auto Perfect",
-	Flag = "AutoPerfect",
+gbPanicStatus:CreateStatus({
+	Name = "Action",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		if not S.panicOn then return "inactive", "Muted" end
+		if S.panicWho then
+			return ("paused (%s)"):format(tostring(S.panicWho)), "Warning"
+		end
+		return "monitoring", "Success"
+	end,
+})
+
+gbPanic:CreateToggle({
+	Name = "Panic Mode",
+	Flag = "PanicMode",
+	CurrentValue = S.panicOn or false,
+	Callback = function(on)
+		S.panicOn = on
+	end,
+})
+
+gbPanic:CreateSlider({
+	Name = "Panic radius",
+	Range = {30, 150},
+	Increment = 5,
+	CurrentValue = S.panicRadius or 50,
+	Suffix = " studs",
+	Flag = "PanicRadius",
+	Callback = function(n)
+		S.panicRadius = n
+	end,
+})
+
+gbVisualPerf:CreateToggle({
+	Name = "FPS Boost",
+	Flag = "FpsBoost",
 	CurrentValue = false,
 	Callback = function(on)
-		S.perfectOn = on
-		if on then
-			perfect_hook_install()
-			pcall(function() perfLabel:Set("on") end)
-			task.spawn(function()
-				local myToken = S.token
-				while S.perfectOn and S.token == myToken do
-					local state = getgenv().__BlizzardPerfHook
-					pcall(function() perfLabel:Set("on  " .. tostring(state and state.count or 0)) end)
-					task.wait(1)
-				end
-			end)
-		else
-			perfect_hook_remove()
-			pcall(function() perfLabel:Set("off") end)
-		end
+		VISUAL.setFpsBoost(on)
+	end,
+})
+
+gbVisualPerf:CreateToggle({
+	Name = "Ultra FPS Boost",
+	Flag = "UltraFps",
+	CurrentValue = false,
+	Callback = function(on)
+		VISUAL.setUltraFps(on)
+	end,
+})
+
+gbVisualPerf:CreateToggle({
+	Name = "Super Ultra FPS Boost",
+	Flag = "SuperUltraFps",
+	CurrentValue = false,
+	Callback = function(on)
+		VISUAL.setSuperUltraFps(on)
 	end,
 })
 
@@ -2462,7 +2864,7 @@ gbFarm:CreateSlider({
 
 gbFarm:CreateSlider({
 	Name = "Refresh every",
-	Range = {1, 5},
+	Range = {1, 20},
 	Increment = 1,
 	CurrentValue = S.refreshRate or 1,
 	Suffix = "s",
@@ -2499,100 +2901,22 @@ gbFarm:CreateToggle({
 	end,
 })
 
-gbFarm:CreateToggle({
-	Name = "Panic Mode",
-	Flag = "PanicMode",
-	CurrentValue = false,
-	Callback = function(on)
-		S.panicOn = on
-	end,
-})
+WALK.label = gbMove:CreateLabel("mode: " .. (S.moveMode == "bike" and "bike tp (wip)" or "respawn tp"))
 
--- *Movement: walk is the default. The teleport still trips the server on long runs,
--- so walk gets first billing and the teleport sits behind an explicit opt-in.
--- Kept in one table to stay under Lua's 200-local ceiling.*
-local gbMove = farmTab:CreateGroupbox({Name = "Movement", Side = "Right"})
-WALK.label = gbMove:CreateLabel("mode: walk")
-
-gbMove:CreateButton({
-	Name = "Mode: Walk",
-	Callback = function()
-		S.moveMode = "walk"
-		safe_set(WALK.label, "mode: walk")
-	end,
-})
-
-gbMove:CreateButton({
-	Name = "Mode: Teleport",
-	Callback = function()
-		S.moveMode = "teleport"
-		safe_set(WALK.label, "mode: teleport (may snap back)")
-	end,
-})
-
--- *respawn-TP: the strongest bypass found. Kill, then jump in the post-spawn window.
--- Costs one death per trip and strips the axe back to the backpack.*
-gbMove:CreateButton({
-	Name = "Mode: Respawn TP",
-	Callback = function()
-		S.moveMode = "respawn"
-		safe_set(WALK.label, "mode: respawn tp (kills you each trip)")
-	end,
-})
-
-gbMove:CreateSlider({
-	Name = "Respawn TP delay",
-	Range = {0, 100},
-	Increment = 5,
-	CurrentValue = math.floor((S.respawnDelay or 0.15) * 100),
-	Suffix = " ms",
-	Flag = "RespawnDelay",
-	Callback = function(n) S.respawnDelay = (tonumber(n) or 15) / 100 end,
-})
-
-gbMove:CreateSlider({
-	Name = "Walk speed",
-	Range = {16, 120},
-	Increment = 4,
-	CurrentValue = S.walkSpeed or 32,
-	Suffix = " st/s",
-	Flag = "WalkSpeed",
-	Callback = function(n) S.walkSpeed = n end,
-})
-
-gbMove:CreateSlider({
-	Name = "Walk, teleport beyond",
-	Range = {100, 900},
-	Increment = 50,
-	CurrentValue = S.walkTeleportBeyond or 400,
-	Suffix = " st",
-	Flag = "WalkBeyond",
-	Callback = function(n) S.walkTeleportBeyond = n end,
-})
-
-gbMove:CreateToggle({
-	Name = "Strip map while walking",
-	Flag = "WalkStrip",
-	CurrentValue = S.walkStripMap ~= false,
-	Callback = function(on) S.walkStripMap = on end,
-})
-
-gbMove:CreateToggle({
-	Name = "Teleport if walk fails",
-	Flag = "WalkTpFallback",
-	CurrentValue = S.walkAllowTeleportFallback == true,
-	Callback = function(on) S.walkAllowTeleportFallback = on end,
-})
-
-gbFarm:CreateSlider({
-	Name = "Panic radius",
-	Range = {30, 150},
-	Increment = 5,
-	CurrentValue = S.panicRadius or 50,
-	Suffix = " studs",
-	Flag = "PanicRadius",
-	Callback = function(n)
-		S.panicRadius = n
+gbMove:CreateDropdown({
+	Name = "Movement Method",
+	Flag = "MovementMethod",
+	Options = {"Respawn TP", "Bike TP (WIP)"},
+	CurrentOption = (S.moveMode == "bike") and "Bike TP (WIP)" or "Respawn TP",
+	Callback = function(sel)
+		local chosen = type(sel) == "table" and sel[1] or sel
+		if chosen == "Bike TP (WIP)" then
+			S.moveMode = "bike"
+			safe_set(WALK.label, "mode: bike tp (wip)")
+		else
+			S.moveMode = "respawn"
+			safe_set(WALK.label, "mode: respawn tp")
+		end
 	end,
 })
 
@@ -2694,49 +3018,6 @@ gbSession:CreateButton({
 	end,
 })
 
-gbServer:CreateLabel("no auto-hop: stay on this server")
-
-local function claim_all_quests()
-	local RS = game:GetService("ReplicatedStorage")
-	local Knit = require(RS.Packages.Knit)
-	local QC = require(RS.Modules.QuestConfig)
-	local QS = Knit.GetService("QuestService")
-
-	local claimed, notready, far = 0, 0, 0
-	local notes = {}
-
-	for _, line in ipairs(QC.Lines) do
-		pcall(function() QS:Meet(line.Id) end)
-		local acc = call(QS, "Accept", line.Id)
-		if type(acc) == "table" and acc.Ok then
-			table.insert(notes, "accept " .. tostring(line.Id))
-		end
-		local res = call(QS, "HandIn", line.Id)
-		if type(res) == "table" then
-			if res.Ok then
-				claimed += 1
-			elseif res.Reason == "NotReady" then
-				notready += 1
-			else
-				far += 1
-			end
-		end
-	end
-
-	local msg = ("%d claimed  %d busy  %d far"):format(claimed, notready, far)
-	if claimed > 0 or #notes > 0 then
-		msg = msg .. "  (" .. table.concat(notes, ", "):sub(1, 60) .. ")"
-	end
-	safe_set(questLabel, msg)
-end
-
-gbQuest:CreateButton({
-	Name = "Claim all quests",
-	Callback = function()
-		task.spawn(function() claim_all_quests() end)
-	end,
-})
-
 local autobuyOn = false
 
 local function refresh_ladder()
@@ -2745,7 +3026,7 @@ local function refresh_ladder()
 	for _, row in ipairs(axeRows) do
 		local isOwned = own[row.axe.id] == true
 		local tag = isOwned and (eq == row.axe.id and "  [equipped]" or "  [owned]") or ""
-		row.button:SetText(("%s  $%d  power %.1f%s"):format(row.axe.name, row.axe.price, row.axe.power, tag))
+		row.button:SetText(("%s  %s  Lv.%s  power %.1f%s"):format(row.axe.name, fmt_price(row.axe.price), tostring(row.axe.level or 1), row.axe.power, tag))
 		pcall(function() row.button:SetDisabled(isOwned) end)
 	end
 	refresh_axe_info()
@@ -2753,7 +3034,7 @@ end
 
 for _, axe in ipairs(ladder) do
 	local button = gbLadder:CreateButton({
-		Name = ("%s  $%d  power %.1f"):format(axe.name, axe.price, axe.power),
+		Name = ("%s  %s  Lv.%s  power %.1f"):format(axe.name, fmt_price(axe.price), tostring(axe.level or 1), axe.power),
 		Callback = function()
 			task.spawn(function()
 				buyLabel:Set("auto buy: manual")
@@ -2824,7 +3105,8 @@ gbAxes:CreateButton({
 })
 
 local function find_miku()
-	local npcs = workspace:FindFirstChild("Map") and workspace.Map:FindFirstChild("NPCs")
+	local map = workspace:FindFirstChild("Map")
+	local npcs = map and map:FindFirstChild("NPCs")
 	if npcs then
 		local m = npcs:FindFirstChild("Merchant")
 		if m and m:IsA("Model") then
@@ -2834,19 +3116,17 @@ local function find_miku()
 			if ok and pos then return pos, "Miku (travelling merchant)" end
 		end
 	end
+	local wanderer = map and map:FindFirstChild("Wanderer")
+	if wanderer and wanderer:IsA("Model") then
+		local root = wanderer:FindFirstChild("HumanoidRootPart")
+		if root then return root.Position, "Wanderer" end
+		local ok, pos = pcall(function() return wanderer:GetPivot().Position end)
+		if ok and pos then return pos, "Wanderer" end
+	end
 	for _, p in ipairs(game.Players:GetPlayers()) do
-		if p ~= plr
-			and (string.lower(p.Name):match("miku") or string.lower(p.DisplayName):match("miku")) then
+		if p ~= plr and (string.lower(p.Name):match("miku") or string.lower(p.DisplayName):match("miku")) then
 			local root = p.Character and p.Character:FindFirstChild("HumanoidRootPart")
 			if root then return root.Position, "player " .. p.Name end
-		end
-	end
-	for _, d in ipairs(workspace:GetDescendants()) do
-		if string.lower(d.Name):match("miku") then
-			local pos
-			if d:IsA("Model") then pos = d:GetPivot().Position
-			elseif d:IsA("BasePart") then pos = d.Position end
-			if pos then return pos, d.Name end
 		end
 	end
 	return nil, nil
@@ -2883,6 +3163,13 @@ plr.CharacterAdded:Connect(function()
 		task.wait(0.6)
 		noclipOn = true
 		equip_axe()
+	end
+	if S.hideIngameName then
+		task.delay(0.5, function()
+			if S.hideIngameName and S.set_hide_ingame_name then
+				S.set_hide_ingame_name(true)
+			end
+		end)
 	end
 end)
 
@@ -3127,7 +3414,7 @@ task.spawn(function()
 				end
 			end
 		end
-		task.wait(math.clamp(tonumber(S.refreshRate) or 1, 0.25, 10))
+		task.wait(math.clamp(tonumber(S.refreshRate) or 1, 0.25, 20))
 	end
 end)
 
@@ -3138,6 +3425,30 @@ pcall(function()
 end)
 pcall(function()
 	settingsTab:CreateThemeManager({Name = "Themes", Side = "Right"})
+end)
+pcall(function()
+	local gbControls = settingsTab:CreateGroupbox({Name = "Hub Controls", Side = "Left"})
+	gbControls:CreateLabel("Toggle UI: RightShift")
+	gbControls:CreateToggle({
+		Name = "Hide In-Game Name",
+		Flag = "HideIngameName",
+		Default = (S.hideIngameName ~= false),
+		Callback = function(val)
+			if S.set_hide_ingame_name then
+				S.set_hide_ingame_name(val)
+			end
+		end,
+	})
+	gbControls:CreateButton({
+		Name = "Unload Hub",
+		Callback = function()
+			pcall(function()
+				if ForestFarm and ForestFarm.stop then ForestFarm.stop() end
+				if S.set_hide_ingame_name then S.set_hide_ingame_name(false) end
+				Window:Destroy()
+			end)
+		end,
+	})
 end)
 
 -- *S is the value the farm loops actually read, and it is seeded before the UI exists.
@@ -3217,29 +3528,18 @@ local function sync_state_from_flags()
 	if type(v) == "boolean" then S.includeGrowing = v end
 	v = val("SameIslandOnly")
 	if type(v) == "boolean" then S.sameIslandOnly = v end
-	v = val("WalkSpeed")
-	if tonumber(v) then S.walkSpeed = tonumber(v) end
-	v = val("WalkBeyond")
-	if tonumber(v) then S.walkTeleportBeyond = tonumber(v) end
-	v = val("WalkStrip")
-	if type(v) == "boolean" then S.walkStripMap = v end
-	v = val("WalkTpFallback")
-	if type(v) == "boolean" then S.walkAllowTeleportFallback = v end
-	v = val("RespawnDelay")
-	if tonumber(v) then S.respawnDelay = (tonumber(v) or 15) / 100 end
-	v = val("PanicMode")
-	if type(v) == "boolean" then S.panicOn = v end
-	v = val("PanicRadius")
-	if tonumber(v) then S.panicRadius = tonumber(v) end
-	v = val("AutoSell")
-	if type(v) == "boolean" then S.autoSell = v end
-	v = val("SellAt")
-	if tonumber(v) then S.sellAt = tonumber(v) end
-	v = val("AutoPerfect")
-	if type(v) == "boolean" then
-		S.perfectOn = v
-		if v then perfect_hook_install() else perfect_hook_remove() end
+	v = val("MovementMethod")
+	if type(v) == "string" then
+		S.moveMode = (v == "Bike TP (WIP)") and "bike" or "respawn"
+	elseif type(v) == "table" and v[1] then
+		S.moveMode = (v[1] == "Bike TP (WIP)") and "bike" or "respawn"
 	end
+	v = val("FpsBoost")
+	if type(v) == "boolean" and v ~= VISUAL.fpsBoost then VISUAL.setFpsBoost(v) end
+	v = val("UltraFps")
+	if type(v) == "boolean" and v ~= VISUAL.ultraFps then VISUAL.setUltraFps(v) end
+	v = val("SuperUltraFps")
+	if type(v) == "boolean" and v ~= VISUAL.superUltraFps then VISUAL.setSuperUltraFps(v) end
 	local e = S.esp
 	v = val("EspMaxDist")
 	if tonumber(v) then e.maxDist = tonumber(v) end
@@ -3267,6 +3567,10 @@ local function sync_state_from_flags()
 	if type(v) == "boolean" and v ~= e.trees then esp_apply("trees", v) end
 	v = val("EspMerchants")
 	if type(v) == "boolean" and v ~= e.merchants then esp_apply("merchants", v) end
+	v = val("HideIngameName")
+	if type(v) == "boolean" and v ~= S.hideIngameName and S.set_hide_ingame_name then
+		S.set_hide_ingame_name(v)
+	end
 end
 
 pcall(function()
@@ -3278,6 +3582,9 @@ end)
 -- *LoadAutoload can run before every element exists, so it goes last and syncs after*
 pcall(function() Window:LoadAutoload() end)
 pcall(sync_state_from_flags)
+if S.hideIngameName and S.set_hide_ingame_name then
+	pcall(function() S.set_hide_ingame_name(true) end)
+end
 
 pcall(function()
 	Window:Notify({Title = "Blizzard", Content = "Farm hub ready", Duration = 4})
