@@ -838,6 +838,26 @@ Job   : 14baa559-5036-4063-8087-ea3fdd422ae2
 - Perubahan diimplementasikan pada source code [farm_hub_src.lua](file:///c:/Users/bevan/OneDrive/Documents/ChatGPT/foresters/farm_hub_src.lua).
 - Siap untuk diobfuskasi ulang atau di-deploy.
 
+---
+
+## 2026-10-18 19:58:00 +07:00 — rilis build terobfuskasi terbaru (Centurion v6.2) ke GitHub
+
+Game  : Foresters 🌳 [RELEASE]
+Place : 117020342702668
+Client: 0.743.0.7431134
+Job   : 14baa559-5036-4063-8087-ea3fdd422ae2
+
+### Perubahan
+- Mengganti `farm_hub.lua` dengan build obfuskasi terbaru dari `C:\Users\bevan\Downloads\farm_hub_src-obfuscated.lua` (597.465 bytes) yang sudah mengintegrasikan tab Discord & Changelog.
+- Men-stage, meng-commit, dan meng-push `farm_hub.lua` dan `history.md` ke GitHub repository.
+
+### Alasan
+- Konfirmasi Captain: "udah tuh gw obfscate yg baru gw taruh di donlod".
+
+### Bukti
+- File `farm_hub.lua` terupdate ke 597.465 bytes.
+- Commit dan push ke `origin/main` sukses.
+
 
 
 
