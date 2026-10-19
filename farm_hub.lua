@@ -3895,7 +3895,7 @@ local function init_quest_module()
 		OrchardKeeper = Vector3.new(-546, 18.5, -553),
 		Merchant = Vector3.new(642.75, 6.14, -625.73),
 		LumberMerchant = Vector3.new(-60.6, 28.1, -552.8),
-		Sawmill = Vector3.new(-85, 27.5, -570),
+		Sawmill = Vector3.new(-53.23, 26.58, -539.49),
 	}
 
 	local function get_npc_position(npcId)
@@ -3977,14 +3977,26 @@ local function init_quest_module()
 				return true
 			end
 
-			if (curPos - lastPos).Magnitude < 0.3 then
+			if (curPos - lastPos).Magnitude < 0.4 then
 				stallTime += 0.08
-				if stallTime >= 0.8 then
+				if stallTime >= 0.8 and stallTime < 2.0 then
 					pcall(function() hum.Jump = true end)
 					local right = root.CFrame.RightVector
 					hum:MoveTo(curPos + right * 4.0)
-					task.wait(0.15)
-					stallTime = 0
+					task.wait(0.12)
+				elseif stallTime >= 2.0 and stallTime < 4.5 then
+					pcall(function() hum.Jump = true end)
+					local bwd = (-root.CFrame.LookVector * 5.0) + (root.CFrame.RightVector * 3.5)
+					hum:MoveTo(curPos + bwd)
+					task.wait(0.18)
+				elseif stallTime >= 4.5 and stallTime < 7.5 then
+					pcall(function() hum.Jump = true end)
+					hum:MoveTo(curPos - root.CFrame.LookVector * 6.0)
+					task.wait(0.22)
+				elseif stallTime >= 7.5 then
+					safe_set(actionLabel, "Stuck detected! Unstick respawn...")
+					WALK.respawnJump(destPos)
+					return false, "watchdog respawn unstick"
 				end
 			else
 				stallTime = 0
@@ -4259,21 +4271,111 @@ local function init_quest_module()
 									task.wait(2.0)
 								end
 							elseif ev == "Saw" then
-								safe_set(destLabel, "Sawmill")
-								safe_set(actionLabel, "Moving to Sawmill to saw wood...")
-								local sawmillPos = NPC_MAP.Sawmill
-								travel_to(sawmillPos, 8.0)
-								task.wait(2.0)
+								local char = plr.Character
+								local carried = char and char:FindFirstChild("CarriedTree")
+								local sawbladePos = Vector3.new(-53.23, 26.58, -539.49)
+								local prompt = nil
+								local folder = workspace:FindFirstChild("Map")
+								if folder then
+									for _, m in ipairs(folder:GetDescendants()) do
+										if m:IsA("Model") and m.Name == "Sawblade" then
+											local pp = m:FindFirstChildWhichIsA("ProximityPrompt", true)
+											local bp = m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart")
+											if bp then
+												sawbladePos = bp.Position
+												prompt = pp
+												break
+											end
+										end
+									end
+								end
+
+								if not carried then
+									safe_set(destLabel, "Tree (for Sawmill)")
+									safe_set(actionLabel, "Chopping tree to bring to Sawmill...")
+									local tree, dist = find_quest_tree(targetObj)
+									if tree then
+										local tp = tree:GetPivot().Position
+										local arrived = travel_to(tp, 12.0)
+										if arrived and qState.running and alive() then
+											safe_set(stateLabel, "chopping", "Warning")
+											safe_set(actionLabel, ("Chopping %s..."):format(tree.Name))
+											chop_tree(tree)
+											task.wait(0.4)
+											safe_set(actionLabel, "Picking up felled tree...")
+											pcall(function()
+												local CarryService = Knit.GetService("CarryService")
+												CarryService:Hold(tree)
+											end)
+											pcall(function()
+												local CarryController = Knit.GetController("CarryController")
+												if CarryController and CarryController.Toggle then CarryController:Toggle() end
+											end)
+											task.wait(0.5)
+										end
+									else
+										safe_set(actionLabel, "Waiting for tree to spawn for sawmill...")
+										task.wait(2.0)
+									end
+								else
+									safe_set(destLabel, "Sawblade")
+									safe_set(actionLabel, "Carrying tree to Sawblade...")
+									local arrived = travel_to(sawbladePos, 6.0)
+									if arrived and qState.running and alive() then
+										safe_set(stateLabel, "sawing", "Warning")
+										safe_set(actionLabel, "Operating Sawmill...")
+										task.wait(0.3)
+										if prompt and fireproximityprompt then
+											pcall(function() fireproximityprompt(prompt) end)
+										end
+										pcall(function()
+											local SawmillController = Knit.GetController("SawmillController")
+											if SawmillController and SawmillController._saw then
+												local mill = prompt and prompt:FindFirstAncestorOfClass("Model")
+												SawmillController:_saw(mill)
+											end
+										end)
+										task.wait(0.6)
+										pcall(function()
+											local SawmillController = Knit.GetController("SawmillController")
+											if SawmillController and SawmillController.Finish then
+												local mill = prompt and prompt:FindFirstAncestorOfClass("Model")
+												SawmillController:Finish(mill, 1.0)
+											end
+										end)
+										pcall(function()
+											local SawmillService = Knit.GetService("SawmillService")
+											if SawmillService then
+												local res = SawmillService:FinishSaw("OakIsland", 1.0)
+												if res and res.await then res:await() end
+											end
+										end)
+										task.wait(1.2)
+										local pickupPrompt = prompt and prompt.Parent and prompt.Parent.Parent and prompt.Parent.Parent:FindFirstChild("PickupPrompt", true)
+										if pickupPrompt and pickupPrompt.Enabled and fireproximityprompt then
+											pcall(function() fireproximityprompt(pickupPrompt) end)
+										end
+										safe_set(actionLabel, "Tree sawed into planks successfully!")
+										task.wait(0.5)
+									end
+								end
 							elseif ev == "Sell" or ev == "Haggle" then
 								safe_set(destLabel, "Lumber Merchant")
-								safe_set(actionLabel, "Moving to Merchant to sell...")
+								safe_set(actionLabel, "Moving to Merchant to sell / haggle...")
 								local merchPos = NPC_MAP.LumberMerchant
 								local arrived = travel_to(merchPos, 8.0)
 								if arrived then
 									safe_set(stateLabel, "selling", "Warning")
-									safe_set(actionLabel, "Selling lumber...")
+									safe_set(actionLabel, "Haggling & selling lumber...")
+									task.wait(0.3)
+									pcall(function()
+										local LumberMillService = Knit.GetService("LumberMillService")
+										local res = LumberMillService:Haggle()
+										if res and res.await then res:await() end
+									end)
+									task.wait(0.4)
 									auto_sell_pass()
-									task.wait(1.5)
+									task.wait(1.0)
 								end
 							elseif targetObj.Spot then
 								local spotPos, spotPart = find_quest_spot(targetObj.Spot)
