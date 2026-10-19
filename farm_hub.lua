@@ -4154,7 +4154,7 @@ local function init_quest_module()
 							or (line.Name and line.Name:find(qState.targetLine))
 
 						if matchFilter then
-							local lState = QuestConfig.LineState(line, data)
+							local lState = QuestConfig.LineState(data.Quests, line, data.Level)
 							if lState == "Active" then
 								local q = QuestConfig.ActiveQuest(data.Quests, line.Id)
 								if q then
@@ -4325,7 +4325,7 @@ local function init_quest_module()
 								or (line.Name and line.Name:find(qState.targetLine))
 
 							if matchFilter then
-								local lState = QuestConfig.LineState(line, data)
+								local lState = QuestConfig.LineState(data.Quests, line, data.Level)
 								if lState == "Available" then
 									foundAvailable = line
 									break
@@ -4498,7 +4498,7 @@ local function init_quest_module()
 				if not data or not data.Quests then return end
 				local count = 0
 				for _, line in ipairs(QuestConfig.Lines or {}) do
-					if QuestConfig.LineState(line, data) == "Available" then
+					if QuestConfig.LineState(data.Quests, line, data.Level) == "Available" then
 						try_accept_line(line)
 						count += 1
 					end
