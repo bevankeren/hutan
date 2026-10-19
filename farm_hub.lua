@@ -14,6 +14,8 @@ local AxeService = Knit.GetService("AxeService")
 local LumberMillService = Knit.GetService("LumberMillService")
 local SawmillService = Knit.GetService("SawmillService")
 local CarryService = Knit.GetService("CarryService")
+local QuestService = Knit.GetService("QuestService")
+local QuestSpotService = Knit.GetService("QuestSpotService")
 
 local AxeConfig = require(RS.Modules.Lumber.AxeConfig)
 local AxePrice = require(RS.Modules.Lumber.AxePrice)
@@ -2018,25 +2020,39 @@ function VISUAL.setUltraFps(on)
 	VISUAL.ultraFps = on
 	VISUAL.setFpsBoost(on)
 	if on then
-		pcall(function()
+		task.spawn(function()
+			local count = 0
 			for _, d in ipairs(workspace:GetDescendants()) do
+				if not VISUAL.ultraFps then break end
 				if d:IsA("ParticleEmitter") or d:IsA("Beam") or d:IsA("Trail")
 					or d:IsA("Fire") or d:IsA("Smoke") or d:IsA("Sparkles") then
-					d.Enabled = false
+					pcall(function() d.Enabled = false end)
 				elseif d:IsA("Decal") or d:IsA("Texture") then
-					d.Transparency = 1
+					pcall(function() d.Transparency = 1 end)
 				elseif d:IsA("BasePart") then
-					d.CastShadow = false
-					d.Material = Enum.Material.SmoothPlastic
-					d.Reflectance = 0
+					pcall(function()
+						d.CastShadow = false
+						d.Material = Enum.Material.SmoothPlastic
+						d.Reflectance = 0
+					end)
+				end
+				count += 1
+				if count % 400 == 0 then
+					task.wait()
 				end
 			end
 		end)
 	else
-		pcall(function()
+		task.spawn(function()
+			local count = 0
 			for _, d in ipairs(workspace:GetDescendants()) do
+				if VISUAL.ultraFps then break end
 				if d:IsA("Decal") or d:IsA("Texture") then
-					d.Transparency = 0
+					pcall(function() d.Transparency = 0 end)
+				end
+				count += 1
+				if count % 400 == 0 then
+					task.wait()
 				end
 			end
 		end)
@@ -2054,11 +2070,6 @@ function VISUAL.setSuperUltraFps(on)
 			Lighting.ClockTime = 14
 			Lighting.Ambient = Color3.fromRGB(150, 150, 150)
 			Lighting.OutdoorAmbient = Color3.fromRGB(150, 150, 150)
-			for _, d in ipairs(workspace:GetDescendants()) do
-				if d:IsA("MeshPart") then
-					d.RenderFidelity = Enum.RenderFidelity.Performance
-				end
-			end
 		end)
 	end
 end
@@ -2250,6 +2261,7 @@ end
 
 local farmTab = Window:CreateTab({Name = "Farm", Icon = "tree-pine"})
 local levelingTab = Window:CreateTab({Name = "Leveling", Icon = "trending-up"})
+local questTab = Window:CreateTab({Name = "Quest", Icon = "scroll"})
 local teleportTab = Window:CreateTab({Name = "Teleport", Icon = "map-pin"})
 local axeTab = Window:CreateTab({Name = "Axes", Icon = "axe"})
 local visualTab = Window:CreateTab({Name = "Visual", Icon = "eye"})
@@ -3840,6 +3852,668 @@ local function init_leveling_module()
 	})
 end
 init_leveling_module()
+
+local function init_quest_module()
+	local gbQuestControls = questTab:CreateGroupbox({Name = "Quest Controls", Side = "Left"})
+	local gbQuestStatus = questTab:CreateGroupbox({Name = "Status & Target", Side = "Right"})
+
+	local DataController = nil
+	pcall(function() DataController = Knit.GetController("DataController") end)
+	local QuestConfig = nil
+	pcall(function() QuestConfig = require(RS.Modules.QuestConfig) end)
+
+	local qState = {
+		running = false,
+		autoAccept = true,
+		autoHandIn = true,
+		targetLine = "All",
+		walkThreshold = 150,
+		walkSpeed = 22,
+	}
+
+	local NPC_MAP = {
+		OldJack = Vector3.new(-67, 27.25, -576),
+		Linnea = Vector3.new(704, 24.3, -588),
+		Coral = Vector3.new(78, 20.5, 142),
+		Frost = Vector3.new(1385, 23.8, -604),
+		Dale = Vector3.new(-536, 11.3, 357),
+		Thorne = Vector3.new(-12, 12.8, -1220),
+		Pip = Vector3.new(668, 17.3, -540),
+		Hattie = Vector3.new(649, 8.0, -521),
+		Walt = Vector3.new(-224, 6.9, -591),
+		Wren = Vector3.new(-135, 15.2, -525),
+		Seraphine = Vector3.new(-25, 78.6, -558),
+		Enchanter = Vector3.new(-25, 78.6, -558),
+		Thicket = Vector3.new(-26, 76.6, -553),
+		TumbleweedTom = Vector3.new(-522, 11.3, 330),
+		Gus = Vector3.new(-648, 12.5, 315),
+		Ansel = Vector3.new(-42, 13.5, -1250),
+		Iris = Vector3.new(35, 12.8, -1185),
+		Halvard = Vector3.new(1340, 22.1, -650),
+		Remy = Vector3.new(125, 18.2, 180),
+		Marta = Vector3.new(90, 19.5, 120),
+		OrchardKeeper = Vector3.new(-546, 18.5, -553),
+		Merchant = Vector3.new(642.75, 6.14, -625.73),
+		LumberMerchant = Vector3.new(-60.6, 28.1, -552.8),
+		Sawmill = Vector3.new(-85, 27.5, -570),
+	}
+
+	local function get_npc_position(npcId)
+		if not npcId then return nil, nil end
+		local folder = workspace:FindFirstChild("Map") and workspace.Map:FindFirstChild("NPCs")
+		if folder then
+			for _, m in ipairs(folder:GetDescendants()) do
+				if m:IsA("Model") and (m:GetAttribute("NpcId") == npcId or m.Name == npcId) then
+					local root = m:FindFirstChild("HumanoidRootPart") or m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart")
+					if root then return root.Position, m end
+				end
+			end
+		end
+		if NPC_MAP[npcId] then
+			return NPC_MAP[npcId], nil
+		end
+		return nil, nil
+	end
+
+	-- UI Elements
+	local stateLabel = gbQuestStatus:CreateStatus({Name = "State", Style = "Dot", Value = "idle"})
+	local lineLabel = gbQuestStatus:CreateStatus({Name = "Line", Style = "Row", Value = "-"})
+	local questLabel = gbQuestStatus:CreateStatus({Name = "Quest", Style = "Row", Value = "-"})
+	local objLabel = gbQuestStatus:CreateLabel("-")
+	local progLabel = gbQuestStatus:CreateStatus({Name = "Progress", Style = "Row", Value = "-"})
+	local destLabel = gbQuestStatus:CreateLabel("-")
+	local actionLabel = gbQuestStatus:CreateLabel("Ready")
+
+	local function safe_set(item, val, optStyle)
+		pcall(function() item:Set(val, optStyle) end)
+	end
+
+	local function smart_quest_walk(destPos, speed, stopDist)
+		local char = plr.Character
+		local root = char and char:FindFirstChild("HumanoidRootPart")
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		if not (root and hum) then return false, "no character" end
+
+		speed = math.clamp(tonumber(speed or qState.walkSpeed or 22) or 22, 16, 24)
+		stopDist = stopDist or 5.0
+		hum.WalkSpeed = speed
+		hum.AutoRotate = true
+
+		local pf = game:GetService("PathfindingService")
+		local path = pf:CreatePath({
+			AgentRadius = 2.4,
+			AgentHeight = 5.0,
+			AgentCanJump = true,
+			AgentJumpHeight = 3.5,
+			AgentMaxSlope = 45,
+			WaypointSpacing = 4.0,
+			Costs = { Water = math.huge }
+		})
+
+		local ok = pcall(function() path:ComputeAsync(root.Position, destPos) end)
+		if not ok or path.Status ~= Enum.PathStatus.Success then
+			local t0 = os.clock()
+			while (root.Position - destPos).Magnitude > stopDist and (os.clock() - t0 < 8) and qState.running and alive() do
+				hum.WalkSpeed = speed
+				hum:MoveTo(destPos)
+				task.wait(0.1)
+			end
+			return (root.Position - destPos).Magnitude <= (stopDist + 2)
+		end
+
+		local waypoints = path:GetWaypoints()
+		if not waypoints or #waypoints == 0 then return false end
+
+		local currIdx = 2
+		local lastPos = root.Position
+		local stallTime = 0
+		local tStart = os.clock()
+		local maxTime = math.max(12, (#waypoints * 0.45) + 6)
+
+		while currIdx <= #waypoints and (os.clock() - tStart < maxTime) and qState.running and alive() do
+			hum.WalkSpeed = speed
+			local curPos = root.Position
+			if (curPos - destPos).Magnitude <= stopDist then
+				return true
+			end
+
+			if (curPos - lastPos).Magnitude < 0.3 then
+				stallTime += 0.08
+				if stallTime >= 0.8 then
+					pcall(function() hum.Jump = true end)
+					local right = root.CFrame.RightVector
+					hum:MoveTo(curPos + right * 4.0)
+					task.wait(0.15)
+					stallTime = 0
+				end
+			else
+				stallTime = 0
+				lastPos = curPos
+			end
+
+			local wp = waypoints[currIdx]
+			local wpPos = wp.Position
+			local horizDist = math.sqrt((curPos.X - wpPos.X)^2 + (curPos.Z - wpPos.Z)^2)
+			local yDiff = wpPos.Y - curPos.Y
+
+			if yDiff > 1.2 and yDiff <= 4.0 then
+				pcall(function() hum.Jump = true end)
+			end
+
+			hum:MoveTo(wpPos)
+			if horizDist <= 3.2 then
+				currIdx += 1
+			end
+			task.wait(0.04)
+		end
+		return (root.Position - destPos).Magnitude <= (stopDist + 2.5)
+	end
+
+	local function travel_to(destPos, stopDist)
+		local root = hrp()
+		if not root then return false end
+		local dist = (destPos - root.Position).Magnitude
+		local threshold = tonumber(qState.walkThreshold) or 150
+		stopDist = stopDist or 5.0
+
+		if dist > threshold then
+			safe_set(stateLabel, "respawn tp", "Warning")
+			safe_set(actionLabel, ("Respawn TP (%.0fm > %dm)..."):format(dist, threshold))
+			local okTp = WALK.respawnJump(destPos)
+			task.wait(0.5)
+			root = hrp()
+			if not root then return false end
+		end
+
+		local remainDist = (destPos - root.Position).Magnitude
+		if remainDist > stopDist then
+			safe_set(stateLabel, "walking", "Warning")
+			safe_set(actionLabel, ("Walking legit (%.0fm @ %d)..."):format(remainDist, qState.walkSpeed))
+			return smart_quest_walk(destPos, qState.walkSpeed, stopDist)
+		end
+		return true
+	end
+
+	local function find_quest_tree(obj)
+		local folder = workspace:FindFirstChild("Map") and workspace.Map:FindFirstChild("Trees")
+		if not folder then return nil, 0 end
+		local myRoot = hrp()
+		local myPos = myRoot and myRoot.Position or Vector3.zero
+		local bestTree, bestDist = nil, math.huge
+
+		for _, t in ipairs(folder:GetChildren()) do
+			if is_live(t) and not is_growing(t) then
+				local matches = true
+				if QuestConfig and QuestConfig.TreeInfo and QuestConfig.Matches then
+					local okMatch, res = pcall(function()
+						local info = QuestConfig.TreeInfo(t)
+						return QuestConfig.Matches(obj, info)
+					end)
+					if okMatch then matches = res end
+				else
+					if obj.Species and t:GetAttribute("Species") ~= obj.Species and t.Name ~= obj.Species then
+						matches = false
+					end
+					if obj.Biome and t:GetAttribute("Biome") ~= obj.Biome then
+						matches = false
+					end
+				end
+				if matches then
+					local tp = t:GetPivot().Position
+					local d = (tp - myPos).Magnitude
+					if d < bestDist then
+						bestDist = d
+						bestTree = t
+					end
+				end
+			end
+		end
+		return bestTree, bestDist
+	end
+
+	local function find_quest_spot(spotName)
+		if not spotName then return nil end
+		local folder = workspace:FindFirstChild("Map")
+		if folder then
+			for _, d in ipairs(folder:GetDescendants()) do
+				if d.Name == spotName or d:GetAttribute("Spot") == spotName then
+					local p = d:IsA("BasePart") and d.Position or (d:IsA("Model") and d:GetPivot().Position)
+					if p then return p, d end
+				end
+			end
+		end
+		return nil, nil
+	end
+
+	local function try_accept_line(line)
+		if not line then return false end
+		local okCall = pcall(function()
+			local res = QuestService:Accept(line.Id)
+			if res and type(res) == "table" and res.await then res:await() end
+		end)
+		if not okCall then
+			pcall(function()
+				local rf = RS.Packages._Index["sleitnick_knit@1.4.7"].knit.Services.QuestService.RF:FindFirstChild("Accept")
+				if rf then rf:InvokeServer(line.Id) end
+			end)
+		end
+		return true
+	end
+
+	local function try_hand_in_line(line)
+		if not line then return false end
+		local okCall = pcall(function()
+			local res = QuestService:HandIn(line.Id)
+			if res and type(res) == "table" and res.await then res:await() end
+		end)
+		if not okCall then
+			pcall(function()
+				local rf = RS.Packages._Index["sleitnick_knit@1.4.7"].knit.Services.QuestService.RF:FindFirstChild("HandIn")
+				if rf then rf:InvokeServer(line.Id) end
+			end)
+		end
+		return true
+	end
+
+	local function start_quest_loop()
+		task.spawn(function()
+			while qState.running and alive() do
+				local okLoop, errLoop = pcall(function()
+					local myRoot = hrp()
+					if not myRoot then
+						safe_set(stateLabel, "no char", "Warning")
+						task.wait(0.5)
+						return
+					end
+
+					if not DataController then
+						pcall(function() DataController = Knit.GetController("DataController") end)
+					end
+					if not QuestConfig then
+						pcall(function() QuestConfig = require(RS.Modules.QuestConfig) end)
+					end
+
+					local data = nil
+					pcall(function() data = DataController:GetCurrentPlayerData() end)
+					if not data or type(data) ~= "table" or not data.Quests then
+						safe_set(stateLabel, "no data", "Warning")
+						safe_set(actionLabel, "Waiting for player data...")
+						task.wait(1.0)
+						return
+					end
+
+					local lines = QuestConfig and QuestConfig.Lines or {}
+					local activeLine = nil
+					local activeQuest = nil
+					local isReadyToHandIn = false
+
+					for _, line in ipairs(lines) do
+						local matchFilter = (qState.targetLine == "All")
+							or (qState.targetLine == line.Id)
+							or (qState.targetLine == line.Name)
+							or (line.Name and line.Name:find(qState.targetLine))
+
+						if matchFilter then
+							local lState = QuestConfig.LineState(line, data)
+							if lState == "Active" then
+								local q = QuestConfig.ActiveQuest(data.Quests, line.Id)
+								if q then
+									local ready = QuestConfig.Ready(data, line.Id)
+									if ready then
+										activeLine = line
+										activeQuest = q
+										isReadyToHandIn = true
+										break
+									elseif not activeLine then
+										activeLine = line
+										activeQuest = q
+										isReadyToHandIn = false
+									end
+								end
+							end
+						end
+					end
+
+					-- 1. If quest is READY to Hand In: Complete it!
+					if activeLine and activeQuest and isReadyToHandIn then
+						safe_set(lineLabel, tostring(activeLine.Name or activeLine.Id))
+						safe_set(questLabel, tostring(activeQuest.Title or activeQuest.Id))
+						safe_set(objLabel, "All objectives met! Hand in ready.")
+						safe_set(progLabel, "100% (Ready)", "Success")
+
+						if qState.autoHandIn then
+							local targetNpc = QuestConfig.HandInNpc(activeQuest) or activeLine.Npc
+							local npcPos = get_npc_position(targetNpc)
+							if npcPos then
+								safe_set(destLabel, ("NPC: %s"):format(tostring(targetNpc)))
+								safe_set(actionLabel, ("Traveling to %s to complete..."):format(tostring(targetNpc)))
+								local arrived = travel_to(npcPos, 8.0)
+								if arrived then
+									safe_set(stateLabel, "handing in", "Success")
+									safe_set(actionLabel, ("Completing %s..."):format(tostring(activeQuest.Title)))
+									task.wait(0.4)
+									try_hand_in_line(activeLine)
+									task.wait(0.8)
+									safe_set(stateLabel, "complete", "Success")
+									safe_set(actionLabel, ("Claimed: %s"):format(tostring(activeQuest.Title)))
+									Window:Notify({
+										Title = "Quest Completed!",
+										Content = ("Turned in: %s"):format(tostring(activeQuest.Title)),
+										Duration = 4,
+									})
+								end
+							end
+						else
+							safe_set(stateLabel, "ready hand in", "Success")
+							safe_set(actionLabel, "Auto Hand In is off. Ready to turn in.")
+						end
+						task.wait(1.0)
+						return
+					end
+
+					-- 2. If active quest in progress: Work on undone objectives!
+					if activeLine and activeQuest and not isReadyToHandIn then
+						safe_set(lineLabel, tostring(activeLine.Name or activeLine.Id))
+						safe_set(questLabel, tostring(activeQuest.Title or activeQuest.Id))
+
+						local objs = activeQuest.Objectives or {}
+						local progList = QuestConfig.Progress(data, activeLine.Id) or {}
+						local targetObj = nil
+						local targetObjIdx = 1
+
+						for idx, obj in ipairs(objs) do
+							local needed = QuestConfig.Needed and QuestConfig.Needed(obj) or (tonumber(obj.Count) or 1)
+							local current = tonumber(progList[idx]) or 0
+							if current < needed then
+								targetObj = obj
+								targetObjIdx = idx
+								safe_set(objLabel, tostring(obj.Text or "In progress"))
+								safe_set(progLabel, ("%d / %d"):format(current, needed), "Warning")
+								break
+							end
+						end
+
+						if not targetObj and #objs > 0 then
+							targetObj = objs[1]
+							safe_set(objLabel, tostring(targetObj.Text or "In progress"))
+							safe_set(progLabel, "Working...", "Warning")
+						end
+
+						if targetObj then
+							local ev = targetObj.Event
+							if ev == "Fell" then
+								local tree, dist = find_quest_tree(targetObj)
+								if tree then
+									safe_set(destLabel, ("Tree: %s (%.0fm)"):format(tree.Name, dist))
+									safe_set(actionLabel, ("Moving to tree (%.0fm)..."):format(dist))
+									local tp = tree:GetPivot().Position
+									local arrived = travel_to(tp, 12.0)
+									if arrived and qState.running and alive() then
+										safe_set(stateLabel, "chopping", "Warning")
+										safe_set(actionLabel, ("Chopping %s..."):format(tree.Name))
+										chop_tree(tree)
+									end
+								else
+									safe_set(destLabel, "Searching trees...")
+									safe_set(actionLabel, "No matching tree found nearby. Waiting...")
+									task.wait(2.0)
+								end
+							elseif ev == "Saw" then
+								safe_set(destLabel, "Sawmill")
+								safe_set(actionLabel, "Moving to Sawmill to saw wood...")
+								local sawmillPos = NPC_MAP.Sawmill
+								travel_to(sawmillPos, 8.0)
+								task.wait(2.0)
+							elseif ev == "Sell" or ev == "Haggle" then
+								safe_set(destLabel, "Lumber Merchant")
+								safe_set(actionLabel, "Moving to Merchant to sell...")
+								local merchPos = NPC_MAP.LumberMerchant
+								local arrived = travel_to(merchPos, 8.0)
+								if arrived then
+									safe_set(stateLabel, "selling", "Warning")
+									safe_set(actionLabel, "Selling lumber...")
+									auto_sell_pass()
+									task.wait(1.5)
+								end
+							elseif targetObj.Spot then
+								local spotPos, spotPart = find_quest_spot(targetObj.Spot)
+								if spotPos then
+									safe_set(destLabel, ("Spot: %s"):format(targetObj.Spot))
+									safe_set(actionLabel, ("Moving to spot: %s..."):format(targetObj.Spot))
+									local arrived = travel_to(spotPos, 6.0)
+									if arrived then
+										safe_set(stateLabel, "picking", "Warning")
+										safe_set(actionLabel, ("Collecting %s..."):format(targetObj.Spot))
+										pcall(function() QuestSpotService:Pick(targetObj.Spot) end)
+										task.wait(1.0)
+									end
+								else
+									safe_set(destLabel, ("Spot: %s (unknown)"):format(targetObj.Spot))
+									safe_set(actionLabel, "Searching for quest spot...")
+									task.wait(2.0)
+								end
+							elseif targetObj.Talk or targetObj.HandIn then
+								local talkNpc = targetObj.HandIn or activeLine.Npc
+								local npcPos = get_npc_position(talkNpc)
+								if npcPos then
+									safe_set(destLabel, ("Talk to: %s"):format(tostring(talkNpc)))
+									safe_set(actionLabel, ("Moving to %s to talk..."):format(tostring(talkNpc)))
+									local arrived = travel_to(npcPos, 8.0)
+									if arrived then
+										safe_set(stateLabel, "talking", "Warning")
+										safe_set(actionLabel, ("Talking to %s..."):format(tostring(talkNpc)))
+										pcall(function() QuestService:Ask(activeLine.Id, 1) end)
+										task.wait(1.0)
+									end
+								end
+							else
+								safe_set(actionLabel, "Objective in progress...")
+								task.wait(1.5)
+							end
+						end
+						task.wait(0.5)
+						return
+					end
+
+					-- 3. If no active quest: Check for available questlines to accept!
+					if qState.autoAccept then
+						local foundAvailable = nil
+						for _, line in ipairs(lines) do
+							local matchFilter = (qState.targetLine == "All")
+								or (qState.targetLine == line.Id)
+								or (qState.targetLine == line.Name)
+								or (line.Name and line.Name:find(qState.targetLine))
+
+							if matchFilter then
+								local lState = QuestConfig.LineState(line, data)
+								if lState == "Available" then
+									foundAvailable = line
+									break
+								end
+							end
+						end
+
+						if foundAvailable then
+							safe_set(lineLabel, tostring(foundAvailable.Name or foundAvailable.Id))
+							safe_set(questLabel, "Available to accept")
+							safe_set(objLabel, "Accepting questline...")
+							safe_set(progLabel, "Not started", "Warning")
+							safe_set(stateLabel, "accepting", "Warning")
+							safe_set(actionLabel, ("Accepting: %s..."):format(tostring(foundAvailable.Name)))
+
+							local npcPos = get_npc_position(foundAvailable.Npc)
+							if npcPos then
+								safe_set(destLabel, ("NPC: %s"):format(tostring(foundAvailable.Npc)))
+								local dist = (npcPos - myRoot.Position).Magnitude
+								if dist > 20 then
+									travel_to(npcPos, 10.0)
+								end
+							end
+							task.wait(0.4)
+							try_accept_line(foundAvailable)
+							task.wait(1.0)
+							safe_set(actionLabel, ("Accepted %s!"):format(tostring(foundAvailable.Name)))
+							return
+						end
+					end
+
+					safe_set(stateLabel, "idle")
+					safe_set(actionLabel, "No quests available or target lines completed.")
+					task.wait(2.0)
+				end)
+
+				if not okLoop then
+					safe_set(stateLabel, "error", "Error")
+					safe_set(actionLabel, ("Loop err: %s"):format(tostring(errLoop):sub(1, 28)))
+					task.wait(1.5)
+				end
+			end
+			safe_set(stateLabel, "idle")
+			safe_set(actionLabel, "Auto Quest stopped.")
+		end)
+	end
+
+	-- UI Controls
+	local autoQuestToggle
+	autoQuestToggle = gbQuestControls:CreateToggle({
+		Name = "Auto Quest",
+		Flag = "AutoQuest",
+		CurrentValue = false,
+		Callback = function(on)
+			qState.running = on
+			if on then
+				safe_set(stateLabel, "running", "Success")
+				safe_set(actionLabel, "Starting quest engine...")
+				start_quest_loop()
+			else
+				safe_set(stateLabel, "idle")
+				safe_set(actionLabel, "Auto Quest stopped.")
+			end
+		end,
+	})
+
+	gbQuestControls:CreateToggle({
+		Name = "Auto Accept Available Quests",
+		Flag = "QuestAutoAccept",
+		CurrentValue = true,
+		Callback = function(on)
+			qState.autoAccept = on
+		end,
+	})
+
+	gbQuestControls:CreateToggle({
+		Name = "Auto Complete / Hand In",
+		Flag = "QuestAutoHandIn",
+		CurrentValue = true,
+		Callback = function(on)
+			qState.autoHandIn = on
+		end,
+	})
+
+	gbQuestControls:CreateDropdown({
+		Name = "Target Questline",
+		Flag = "QuestTargetLine",
+		Options = {
+			"All",
+			"Old Jack",
+			"Linnea",
+			"Coral",
+			"Frost",
+			"Dale",
+			"Thorne",
+			"Pip",
+			"Thicket",
+			"Wanderer",
+		},
+		CurrentOption = {"All"},
+		Callback = function(sel)
+			local chosen = type(sel) == "table" and sel[1] or sel
+			qState.targetLine = chosen or "All"
+		end,
+	})
+
+	gbQuestControls:CreateSlider({
+		Name = "Walk vs Respawn Distance",
+		Range = {50, 400},
+		Increment = 10,
+		CurrentValue = 150,
+		Suffix = " studs",
+		Flag = "QuestWalkThreshold",
+		Callback = function(n)
+			qState.walkThreshold = tonumber(n) or 150
+		end,
+	})
+
+	gbQuestControls:CreateSlider({
+		Name = "Walk Speed",
+		Range = {16, 24},
+		Increment = 1,
+		CurrentValue = 22,
+		Suffix = " studs/s",
+		Flag = "QuestWalkSpeed",
+		Callback = function(n)
+			qState.walkSpeed = math.clamp(tonumber(n) or 22, 16, 24)
+		end,
+	})
+
+	gbQuestControls:CreateButton({
+		Name = "Complete / Hand In Active Quest Now",
+		Callback = function()
+			task.spawn(function()
+				if not DataController then pcall(function() DataController = Knit.GetController("DataController") end) end
+				if not QuestConfig then pcall(function() QuestConfig = require(RS.Modules.QuestConfig) end) end
+				local data = nil
+				pcall(function() data = DataController:GetCurrentPlayerData() end)
+				if not data or not data.Quests then
+					Window:Notify({Title = "Hand In", Content = "Cannot read quest data!", Duration = 3})
+					return
+				end
+				for _, line in ipairs(QuestConfig.Lines or {}) do
+					if QuestConfig.Ready(data, line.Id) then
+						local q = QuestConfig.ActiveQuest(data.Quests, line.Id)
+						local targetNpc = QuestConfig.HandInNpc(q) or line.Npc
+						local npcPos = get_npc_position(targetNpc)
+						if npcPos then
+							travel_to(npcPos, 8.0)
+						end
+						task.wait(0.4)
+						try_hand_in_line(line)
+						Window:Notify({Title = "Quest Completed!", Content = "Turned in: " .. tostring(q and q.Title or line.Id), Duration = 4})
+						return
+					end
+				end
+				Window:Notify({Title = "Hand In", Content = "No quests ready to hand in.", Duration = 3})
+			end)
+		end,
+	})
+
+	gbQuestControls:CreateButton({
+		Name = "Accept Available Quests Now",
+		Callback = function()
+			task.spawn(function()
+				if not DataController then pcall(function() DataController = Knit.GetController("DataController") end) end
+				if not QuestConfig then pcall(function() QuestConfig = require(RS.Modules.QuestConfig) end) end
+				local data = nil
+				pcall(function() data = DataController:GetCurrentPlayerData() end)
+				if not data or not data.Quests then return end
+				local count = 0
+				for _, line in ipairs(QuestConfig.Lines or {}) do
+					if QuestConfig.LineState(line, data) == "Available" then
+						try_accept_line(line)
+						count += 1
+					end
+				end
+				Window:Notify({Title = "Accept Quests", Content = ("Accepted %d available quest(s)."):format(count), Duration = 3})
+			end)
+		end,
+	})
+
+	gbQuestControls:CreateParagraph({
+		Title = "Smart Hybrid Movement",
+		Content = "Jarak dekat (<= threshold) ditempuh dengan jalan kaki normal legit tanpa noclip agar aman dari kick anticheat. Jarak jauh (> threshold) ditempuh instan via Respawn TP langsung ke target.",
+	})
+end
+init_quest_module()
 
 local function init_teleport_module()
 	local gbTeleportArea = teleportTab:CreateGroupbox({Name = "Islands & Areas", Side = "Left"})
